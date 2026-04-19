@@ -233,22 +233,18 @@ export default function MainMenu() {
               <div className="text-[48px] font-[100] leading-none mb-6 flex items-center gap-4"><Settings size={40} /> SETTINGS</div>
               <div className="space-y-[15px] mb-4">
                 <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
-                   <span>X-Plane 12 Cinematic HDR & SSAO Lighting</span>
+                   <span>Real-time Weather & Ray Tracing (Simulated)</span>
                    <input type="checkbox" defaultChecked className="w-[16px] h-[16px] accent-[#26b3ff]" />
                 </div>
                 <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
-                   <span>Real-time Weather & Global Illumination</span>
+                   <span>VR Mode Compatible</span>
                    <input type="checkbox" defaultChecked className="w-[16px] h-[16px] accent-[#26b3ff]" />
                 </div>
                 <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
-                   <span>VR Headset (WebXR) Compatible</span>
-                   <input type="checkbox" defaultChecked className="w-[16px] h-[16px] accent-[#26b3ff]" />
-                </div>
-                <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
-                   <span>Maps & Photogrammetry Provider</span>
+                   <span>Map Provider</span>
                    <select className="bg-[rgba(0,0,0,0.5)] border border-white/20 p-[5px] rounded text-white outline-none">
-                      <option>OpenStreetMap (Default)</option>
-                      <option>Bing Maps Aerial</option>
+                      <option>OpenStreetMap</option>
+                      <option>Bing Maps (Fallback)</option>
                    </select>
                 </div>
               </div>

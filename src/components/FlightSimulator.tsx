@@ -88,7 +88,6 @@ export default function FlightSimulator() {
     called10: false,
     hasApproachedRunway: false,
     sinkRateTriggered: 0,
-    stallTriggered: 0,
   });
 
   const controlsRef = useRef({
@@ -155,36 +154,11 @@ export default function FlightSimulator() {
         timeline: false,
         fullscreenButton: true,
         navigationHelpButton: false,
-        useBrowserRecommendedResolution: true,
       });
-      
-      // Enforce device pixel ratio to stop pixel snap jittering on retina devices
-      viewer.resolutionScale = window.devicePixelRatio;
 
       // Enable Lighting for Day/Night cycle
       viewer.scene.globe.enableLighting = true;
       viewer.scene.globe.depthTestAgainstTerrain = true;
-
-      // X-Plane 12 Cinematic Lighting & Atmospheric Engine Simulation
-      viewer.scene.highDynamicRange = true;
-      viewer.scene.globe.dynamicAtmosphereLighting = true;
-      viewer.scene.globe.dynamicAtmosphereLightingFromSun = true;
-      viewer.scene.globe.showWaterEffect = true;
-      
-      // Fine-tune Rayleigh/Mie atmospheric scattering
-      if (viewer.scene.skyAtmosphere) {
-          viewer.scene.skyAtmosphere.hueShift = -0.05; // Slightly deeper blue base
-          viewer.scene.skyAtmosphere.saturationShift = 0.1; // Richer sunset
-          viewer.scene.skyAtmosphere.brightnessShift = -0.1; // Slightly moodier
-      }
-
-      // Emphasize sun glints
-      if (viewer.scene.sun) {
-          viewer.scene.sun.glowFactor = 2.5; // Larger sun corona
-      }
-
-      // Next-Gen Post-Processing Pipeline
-      viewer.scene.postProcessStages.fxaa.enabled = true; // Anti-aliasing
 
       try {
         viewer.terrainProvider = await Cesium.createWorldTerrainAsync();
@@ -436,22 +410,12 @@ export default function FlightSimulator() {
 
       let lastTime = performance.now();
 
-      const onTick = (clock: Cesium.Clock) => {
+      const onTick = () => {
         if (!viewer || viewer.isDestroyed()) return;
 
-        // Use Cesium's internal frame clock delta time to prevent micro-stutters and jitter 
-        // caused by asynchronous performance.now() drifting out of phase with requestAnimationFrame.
-        // Clamp to 0.1s max to prevent huge physics jumps on lag spikes.
-        let dt = Math.min(viewer.clock.tick() ? viewer.clock.multiplier : 0.016, 0.1); 
-        // Note: actually we'll just track the time manually but clamped so it's smooth and predictable
-        const currentSystemTime = performance.now();
-        let frameDelta = (currentSystemTime - lastTime) / 1000;
-        lastTime = currentSystemTime;
-        
-        // Clamp delta time specifically against extreme spikes, and use a fixed step if it gets wild
-        if (frameDelta > 0.1) frameDelta = 0.016; 
-        if (frameDelta <= 0) frameDelta = 0.001;
-        dt = frameDelta;
+        const now = performance.now();
+        const dt = (now - lastTime) / 1000;
+        lastTime = now;
 
         const state = simState.current;
         const ctrl = controlsRef.current;
@@ -598,8 +562,7 @@ export default function FlightSimulator() {
         const velocitySq = state.velocity * state.velocity;
         
         // AoA depends roughly on pitch relative to flight path, simplified here using pitch directly
-        let aoaDeg = state.pitchAngle * (180/Math.PI);
-        const { drag, lift } = calculateForces(velocitySq, aoaDeg, specs);
+        const { drag } = calculateForces(velocitySq, state.pitchAngle * (180/Math.PI), specs);
         const dragDecel = drag / specs.mass;
         const gravity = 9.81 * Math.sin(state.pitchAngle);
 
@@ -609,25 +572,6 @@ export default function FlightSimulator() {
         if (state.velocity < 0) state.velocity = 0;
 
         const dist = state.velocity * dt;
-        
-        // --- STALL PHYSICS ---
-        const liftAccel = lift / specs.mass;
-        const requiredLiftAccel = 9.81 * Math.cos(state.pitchAngle);
-        let sinkDistance = 0;
-        let isStalling = false;
-        
-        if (spawn !== 'gate') {
-            const deficit = requiredLiftAccel - liftAccel;
-            if (deficit > 0) {
-                 sinkDistance = -deficit * dt;
-                 // Stall parameters: if deficit is significant and AoA is high
-                 if (aoaDeg > 12 || deficit > 5.0) {
-                     isStalling = true;
-                     state.pitchAngle -= 0.5 * dt; // Nose drops uncontrollably due to stall
-                 }
-            }
-        }
-        
         // Cesium's Heading zero points +X (East).
         // H rotation is around -Z (Down), so positive heading turns South (-Y).
         // Therefore, X movement is cos(H) and Y movement is -sin(H)
@@ -639,9 +583,6 @@ export default function FlightSimulator() {
 
         Cesium.Cartesian3.normalize(direction, direction);
         Cesium.Cartesian3.multiplyByScalar(direction, dist, direction);
-        
-        // Apply sink distance from gravity pulling us down if lift is insufficient
-        direction.z += sinkDistance;
 
         const carto = Cesium.Cartographic.fromCartesian(state.position);
         carto.longitude += (direction.x / 6378137) / Math.cos(carto.latitude);
@@ -734,18 +675,6 @@ export default function FlightSimulator() {
         }
 
         if (state.velocity > 30) {
-            // Stall Warning
-            if (isStalling) {
-                 const now = performance.now();
-                 if (now - gpws.stallTriggered > 2000) {
-                     playWarning("Stall! Stall!", true);
-                     gpws.stallTriggered = now;
-                 }
-                 // Add massive buffeting to camera due to turbulent airflow
-                 camControls.current.panTilt += (Math.random() - 0.5) * 0.05;
-                 camControls.current.orbitAlpha += (Math.random() - 0.5) * 0.02;
-            }
-
             // Sink Rate
             if (aglFeet < 2500 && vspeedFpm < -2000) {
                  const now = performance.now();
@@ -869,11 +798,11 @@ export default function FlightSimulator() {
          }
       };
 
-      viewer.scene.preUpdate.addEventListener(onTick);
+      viewer.clock.onTick.addEventListener(onTick);
       
       return () => {
         if (viewer && !viewer.isDestroyed()) {
-          viewer.scene.preUpdate.removeEventListener(onTick);
+          viewer.clock.onTick.removeEventListener(onTick);
         }
         canvas.removeEventListener('mousedown', onMouseDown);
         window.removeEventListener('mouseup', onMouseUp);
