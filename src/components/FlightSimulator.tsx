@@ -5,7 +5,7 @@ import { useFlightStore } from '../store';
 import { Joystick } from 'react-joystick-component';
 import { Camera, RefreshCw, Footprints, Clock, Volume2, ShieldAlert } from 'lucide-react';
 import { aircraftDB, calculateForces } from '../flightModel';
-import { initAudio, updateAudio, stopAudio } from '../audioSystem';
+import { initAudio, updateAudio, stopAudio, playWarning } from '../audioSystem';
 
 export default function FlightSimulator() {
   const viewerRef = useRef<HTMLDivElement>(null);
@@ -40,9 +40,55 @@ export default function FlightSimulator() {
   });
 
   const humanState = useRef({
-    position: Cesium.Cartesian3.fromDegrees(-122.38103, 37.618, 5), // Offset slightly from gate aircraft
+    position: Cesium.Cartesian3.fromDegrees(-122.3813, 37.6181, 5), 
     heading: 0,
-    velocity: 0, // walking speed
+    velocity: 0, 
+  });
+
+  const groundVehiclesState = useRef([
+    {
+      id: 1,
+      position: Cesium.Cartesian3.fromDegrees(-122.3812, 37.6186, 0),
+      heading: 0,
+      center: { lon: -122.3812, lat: 37.6186 },
+      radius: 0.0005,
+      speed: 0.2, // angular speed
+      angle: 0
+    },
+    {
+      id: 2,
+      position: Cesium.Cartesian3.fromDegrees(-122.3815, 37.6180, 0),
+      heading: 0,
+      center: { lon: -122.3815, lat: 37.6180 },
+      radius: 0.0007,
+      speed: -0.15,
+      angle: Math.PI
+    }
+  ]);
+
+  const aiTrafficState = useRef({
+    position: Cesium.Cartesian3.fromDegrees(-122.40, 37.65, 5000), 
+    heading: Math.PI, 
+    velocity: 200,
+  });
+
+  const gpwsState = useRef({
+    lastHeight: spawnMode === 'air' ? 5000 : 0,
+    called2500: false,
+    called1000: false,
+    called500: false,
+    called400: false,
+    called300: false,
+    called200: false,
+    called100: false,
+    called50: false,
+    called40: false,
+    called30: false,
+    called20: false,
+    called10: false,
+    hasApproachedRunway: false,
+    sinkRateTriggered: 0,
+    stallTriggered: 0,
   });
 
   const controlsRef = useRef({
@@ -109,11 +155,36 @@ export default function FlightSimulator() {
         timeline: false,
         fullscreenButton: true,
         navigationHelpButton: false,
+        useBrowserRecommendedResolution: true,
       });
+      
+      // Enforce device pixel ratio to stop pixel snap jittering on retina devices
+      viewer.resolutionScale = window.devicePixelRatio;
 
       // Enable Lighting for Day/Night cycle
       viewer.scene.globe.enableLighting = true;
       viewer.scene.globe.depthTestAgainstTerrain = true;
+
+      // X-Plane 12 Cinematic Lighting & Atmospheric Engine Simulation
+      viewer.scene.highDynamicRange = true;
+      viewer.scene.globe.dynamicAtmosphereLighting = true;
+      viewer.scene.globe.dynamicAtmosphereLightingFromSun = true;
+      viewer.scene.globe.showWaterEffect = true;
+      
+      // Fine-tune Rayleigh/Mie atmospheric scattering
+      if (viewer.scene.skyAtmosphere) {
+          viewer.scene.skyAtmosphere.hueShift = -0.05; // Slightly deeper blue base
+          viewer.scene.skyAtmosphere.saturationShift = 0.1; // Richer sunset
+          viewer.scene.skyAtmosphere.brightnessShift = -0.1; // Slightly moodier
+      }
+
+      // Emphasize sun glints
+      if (viewer.scene.sun) {
+          viewer.scene.sun.glowFactor = 2.5; // Larger sun corona
+      }
+
+      // Next-Gen Post-Processing Pipeline
+      viewer.scene.postProcessStages.fxaa.enabled = true; // Anti-aliasing
 
       try {
         viewer.terrainProvider = await Cesium.createWorldTerrainAsync();
@@ -123,18 +194,25 @@ export default function FlightSimulator() {
 
       if (!isMounted || !viewer) return;
 
-      const osm = new Cesium.OpenStreetMapImageryProvider({
-        url : 'https://a.tile.openstreetmap.org/'
-      });
-      viewer.imageryLayers.addImageryProvider(osm);
+      try {
+         // Create beautiful satellite aerial imagery instead of OSM streets
+         const imagery = await Cesium.createWorldImageryAsync({
+            style: Cesium.IonWorldImageryStyle.AERIAL_WITH_LABELS
+         });
+         viewer.imageryLayers.addImageryProvider(imagery);
+
+         // Add 3D buildings for realism
+         const buildingsTileset = await Cesium.createOsmBuildingsAsync();
+         viewer.scene.primitives.add(buildingsTileset);
+      } catch (e) {
+         console.warn('Failed to load imagery or buildings:', e);
+      }
 
       const specs = aircraftDB[selectedAircraft] || aircraftDB['Boeing 737'];
 
       let modelUri = customModelUrl;
       if (!modelUri) {
-        if (selectedAircraft.includes('737') || selectedAircraft.includes('777')) {
-           modelUri = '/models/commercial.glb'; 
-        }
+        // Fallback to a built-in remote model
         modelUri = 'https://sandcastle.cesium.com/SampleData/models/CesiumAir/Cesium_Air.glb';
       }
 
@@ -155,6 +233,22 @@ export default function FlightSimulator() {
         }
       });
 
+      // Spawn AI Traffic
+      viewer.entities.add({
+         name: "AI Traffic",
+         // @ts-ignore
+         position: new Cesium.CallbackProperty(() => aiTrafficState.current.position, false),
+         orientation: new Cesium.CallbackProperty(() => {
+            const hpr = new Cesium.HeadingPitchRoll(aiTrafficState.current.heading, 0, 0);
+            return Cesium.Transforms.headingPitchRollQuaternion(aiTrafficState.current.position, hpr);
+         }, false),
+         model: {
+            uri: 'https://sandcastle.cesium.com/SampleData/models/CesiumAir/Cesium_Air.glb',
+            minimumPixelSize: 64,
+            maximumScale: 10000,
+         }
+      });
+
       if (spawnMode === 'gate') {
          viewer.entities.add({
             name: 'Human Avatar',
@@ -172,6 +266,56 @@ export default function FlightSimulator() {
                runAnimations: new Cesium.CallbackProperty(() => Math.abs(humanState.current.velocity) > 0.1, false) as unknown as boolean,
             }
          });
+
+         // Add moving ground vehicles
+         groundVehiclesState.current.forEach((vehicle, index) => {
+             viewer?.entities.add({
+                name: `Ground Vehicle ${index + 1}`,
+                // @ts-ignore
+                position: new Cesium.CallbackProperty(() => groundVehiclesState.current[index].position, false),
+                orientation: new Cesium.CallbackProperty(() => {
+                   const hpr = new Cesium.HeadingPitchRoll(groundVehiclesState.current[index].heading, 0, 0);
+                   return Cesium.Transforms.headingPitchRollQuaternion(groundVehiclesState.current[index].position, hpr);
+                }, false),
+                model: {
+                   uri: 'https://sandcastle.cesium.com/SampleData/models/CesiumMilkTruck/CesiumMilkTruck.glb',
+                   minimumPixelSize: 64,
+                   maximumScale: 1,
+                   runAnimations: true,
+                   heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
+                }
+             });
+         });
+
+         // Add a row of street lights along the ramp
+         for (let i = 0; i < 5; i++) {
+             // Add post for street light
+             viewer.entities.add({
+                name: `Light Post ${i + 1}`,
+                position: Cesium.Cartesian3.fromDegrees(-122.3811 + (i * 0.0003), 37.6180, 2.5),
+                cylinder: {
+                   length: 5.0,
+                   topRadius: 0.1,
+                   bottomRadius: 0.1,
+                   material: Cesium.Color.fromCssColorString('#444444'),
+                   heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND
+                }
+             });
+             
+             // Glowing bulb
+             viewer.entities.add({
+                name: `Street Light ${i + 1}`,
+                position: Cesium.Cartesian3.fromDegrees(-122.3811 + (i * 0.0003), 37.6180, 5),
+                point: {
+                   pixelSize: 8,
+                   color: Cesium.Color.fromCssColorString('#fffbb3'),
+                   outlineColor: Cesium.Color.fromCssColorString('rgba(255,251,179,0.5)'),
+                   outlineWidth: 4,
+                   heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND,
+                   disableDepthTestDistance: Number.POSITIVE_INFINITY
+                }
+             });
+         }
       }
 
       // --- Animation Checker ---
@@ -213,7 +357,9 @@ export default function FlightSimulator() {
          } else {
             camControls.current.orbitAlpha -= e.movementX * 0.01;
             camControls.current.orbitBeta += e.movementY * 0.01;
-            camControls.current.orbitBeta = Math.max(-Math.PI/2.5, Math.min(Math.PI/2.5, camControls.current.orbitBeta));
+            
+            const minBeta = cv === 'walk' ? -0.1 : -Math.PI / 2.5;
+            camControls.current.orbitBeta = Math.max(minBeta, Math.min(Math.PI/2.5, camControls.current.orbitBeta));
          }
       };
       
@@ -268,7 +414,13 @@ export default function FlightSimulator() {
          } else {
             camControls.current.orbitAlpha -= dx * 0.01;
             camControls.current.orbitBeta += dy * 0.01;
-            camControls.current.orbitBeta = Math.max(-Math.PI/2.5, Math.min(Math.PI/2.5, camControls.current.orbitBeta));
+            
+            // Limit orbit beta to prevent going too far underground
+            let minBeta = -Math.PI / 2.5; 
+            if (cv === 'walk') {
+               minBeta = -0.05; // Prevent camera from going low enough to clip terrain near human feet
+            }
+            camControls.current.orbitBeta = Math.max(minBeta, Math.min(Math.PI/2.5, camControls.current.orbitBeta));
          }
       };
 
@@ -284,12 +436,22 @@ export default function FlightSimulator() {
 
       let lastTime = performance.now();
 
-      const onTick = () => {
+      const onTick = (clock: Cesium.Clock) => {
         if (!viewer || viewer.isDestroyed()) return;
 
-        const now = performance.now();
-        const dt = (now - lastTime) / 1000;
-        lastTime = now;
+        // Use Cesium's internal frame clock delta time to prevent micro-stutters and jitter 
+        // caused by asynchronous performance.now() drifting out of phase with requestAnimationFrame.
+        // Clamp to 0.1s max to prevent huge physics jumps on lag spikes.
+        let dt = Math.min(viewer.clock.tick() ? viewer.clock.multiplier : 0.016, 0.1); 
+        // Note: actually we'll just track the time manually but clamped so it's smooth and predictable
+        const currentSystemTime = performance.now();
+        let frameDelta = (currentSystemTime - lastTime) / 1000;
+        lastTime = currentSystemTime;
+        
+        // Clamp delta time specifically against extreme spikes, and use a fixed step if it gets wild
+        if (frameDelta > 0.1) frameDelta = 0.016; 
+        if (frameDelta <= 0) frameDelta = 0.001;
+        dt = frameDelta;
 
         const state = simState.current;
         const ctrl = controlsRef.current;
@@ -300,6 +462,13 @@ export default function FlightSimulator() {
         if (spawn === 'gate') {
            state.velocity = 0;
            const carto = Cesium.Cartographic.fromCartesian(state.position);
+           
+           // Pin airplane to ground
+           if (viewer.scene.globe.getHeight(carto) !== undefined) {
+              carto.height = viewer.scene.globe.getHeight(carto)! + 2; // Add 2m so wheels are above ground
+           }
+           state.position = Cesium.Cartesian3.fromRadians(carto.longitude, carto.latitude, carto.height);
+           
            setAltitude(Math.round(carto.height * 3.28084));
            setSpeedKnots(0);
            updateAudio(0, 0);
@@ -338,12 +507,30 @@ export default function FlightSimulator() {
            hCarto.longitude += (hDirection.x / 6378137) / Math.cos(hCarto.latitude);
            hCarto.latitude += hDirection.y / 6378137;
            // Pin human to ground
-           if (viewer.scene.globe.getHeight(hCarto) !== undefined) {
-              hCarto.height = viewer.scene.globe.getHeight(hCarto)!;
+           const height = viewer.scene.globe.getHeight(hCarto);
+           if (height !== undefined) {
+              hCarto.height = height + 0.1; // Character's pivot is at their feet usually, slight bump to clear Z-fighting
+           } else {
+              hCarto.height = 5;
            }
 
            hState.position = Cesium.Cartesian3.fromRadians(hCarto.longitude, hCarto.latitude, hCarto.height);
            
+           // --- Ground Vehicles Logic ---
+           groundVehiclesState.current.forEach(vehicle => {
+               vehicle.angle += vehicle.speed * dt;
+               const lon = vehicle.center.lon + vehicle.radius * Math.cos(vehicle.angle);
+               const lat = vehicle.center.lat + vehicle.radius * Math.sin(vehicle.angle);
+               // Calculate heading
+               vehicle.heading = vehicle.speed > 0 ? vehicle.angle + Math.PI / 2 : vehicle.angle - Math.PI / 2;
+               
+               const c3 = Cesium.Cartesian3.fromDegrees(lon, lat, 0);
+               const cartoV = Cesium.Cartographic.fromCartesian(c3);
+               const groundHeight = viewer?.scene.globe.getHeight(cartoV);
+               cartoV.height = groundHeight !== undefined ? groundHeight : 5;
+               vehicle.position = Cesium.Cartesian3.fromRadians(cartoV.longitude, cartoV.latitude, cartoV.height);
+           });
+
            // Camera follows human, not airplane
            updateCamera(viewer, hState.position, new Cesium.HeadingPitchRoll(hState.heading, 0, 0));
            return;
@@ -383,20 +570,36 @@ export default function FlightSimulator() {
            setWarningMessage(warning);
         }
         
-        const turnRate = 0.5 * dt;
+        const turnRate = 1.0 * dt; // Increased turn rate for more agile loops/rolls
         state.pitchAngle -= effPitch * turnRate; // Push forward -> nose down -> negative pitch
         state.rollAngle += effRoll * turnRate; // Right -> positive roll -> right wing down
         
-        // Turn plane heading based on current bank angle for natural turning
-        state.heading += state.rollAngle * 0.5 * dt;
+        // Wrap roll angle to -PI and PI
+        if (state.rollAngle > Math.PI) state.rollAngle -= 2 * Math.PI;
+        if (state.rollAngle < -Math.PI) state.rollAngle += 2 * Math.PI;
         
-        state.rollAngle *= 0.98;
-        state.pitchAngle *= 0.98; // add auto-leveling for pitch slightly to make flying easier
+        // Wrap pitch angle to -PI and PI
+        if (state.pitchAngle > Math.PI) state.pitchAngle -= 2 * Math.PI;
+        if (state.pitchAngle < -Math.PI) state.pitchAngle += 2 * Math.PI;
+        
+        // Turn plane heading based on current bank angle for natural turning
+        // Use Math.sin(rollAngle) so it turns fastest at 90deg bank, and doesn't turn when upside down (180deg)
+        state.heading += Math.sin(state.rollAngle) * Math.cos(state.pitchAngle) * 1.5 * dt;
+        
+        // Wrap heading
+        if (state.heading > Math.PI) state.heading -= 2 * Math.PI;
+        if (state.heading < -Math.PI) state.heading += 2 * Math.PI;
+        
+        // Minimal air resistance/damping so controls aren't entirely loose
+        state.rollAngle -= state.rollAngle * 0.005; // tiny damping
+        state.pitchAngle -= state.pitchAngle * 0.005; 
         
         const thrustAccel = currentThrust / specs.mass;
         const velocitySq = state.velocity * state.velocity;
         
-        const { drag } = calculateForces(velocitySq, state.pitchAngle * (180/Math.PI), specs);
+        // AoA depends roughly on pitch relative to flight path, simplified here using pitch directly
+        let aoaDeg = state.pitchAngle * (180/Math.PI);
+        const { drag, lift } = calculateForces(velocitySq, aoaDeg, specs);
         const dragDecel = drag / specs.mass;
         const gravity = 9.81 * Math.sin(state.pitchAngle);
 
@@ -406,6 +609,25 @@ export default function FlightSimulator() {
         if (state.velocity < 0) state.velocity = 0;
 
         const dist = state.velocity * dt;
+        
+        // --- STALL PHYSICS ---
+        const liftAccel = lift / specs.mass;
+        const requiredLiftAccel = 9.81 * Math.cos(state.pitchAngle);
+        let sinkDistance = 0;
+        let isStalling = false;
+        
+        if (spawn !== 'gate') {
+            const deficit = requiredLiftAccel - liftAccel;
+            if (deficit > 0) {
+                 sinkDistance = -deficit * dt;
+                 // Stall parameters: if deficit is significant and AoA is high
+                 if (aoaDeg > 12 || deficit > 5.0) {
+                     isStalling = true;
+                     state.pitchAngle -= 0.5 * dt; // Nose drops uncontrollably due to stall
+                 }
+            }
+        }
+        
         // Cesium's Heading zero points +X (East).
         // H rotation is around -Z (Down), so positive heading turns South (-Y).
         // Therefore, X movement is cos(H) and Y movement is -sin(H)
@@ -417,14 +639,33 @@ export default function FlightSimulator() {
 
         Cesium.Cartesian3.normalize(direction, direction);
         Cesium.Cartesian3.multiplyByScalar(direction, dist, direction);
+        
+        // Apply sink distance from gravity pulling us down if lift is insufficient
+        direction.z += sinkDistance;
 
         const carto = Cesium.Cartographic.fromCartesian(state.position);
         carto.longitude += (direction.x / 6378137) / Math.cos(carto.latitude);
         carto.latitude += direction.y / 6378137;
         carto.height += direction.z;
 
+        // Fetch ground height to prevent clipping
+        const groundHeight = viewer.scene.globe.getHeight(carto) ?? 0;
+        
+        // Ensure plane doesn't tunnel through ground
+        const minHeight = groundHeight + 4; // roughly gear height
+        if (carto.height < minHeight) {
+            carto.height = minHeight;
+            // Level pitch so we don't nose-dive continuously through ground
+            if (state.pitchAngle < -0.1) state.pitchAngle *= 0.5;
+            // Roll auto-level slightly when on ground
+            state.rollAngle *= 0.95;
+            // Apply heavy ground friction if we aren't producing lifting speed
+            if (state.velocity > 0) state.velocity -= 2 * dt; 
+            if (state.velocity < 0) state.velocity = 0;
+        }
+
         // Ground physics lock
-        if (spawn === 'runway' && carto.height <= 6 && accel < 0 && state.velocity < 1) {
+        if (spawn === 'runway' && carto.height <= groundHeight + 6 && accel < 0 && state.velocity < 1) {
              accel = 0; state.velocity = 0;
         }
 
@@ -440,6 +681,119 @@ export default function FlightSimulator() {
         const spd = Math.round(state.velocity * 1.94384);
         setSpeedKnots(spd);
         setAltitude(Math.round(carto.height * 3.28084));
+
+        // --- AI Traffic Logic & TCAS ---
+        const ai = aiTrafficState.current;
+        const aiDist = ai.velocity * dt;
+        const aiDir = new Cesium.Cartesian3(
+            Math.cos(ai.heading),
+            -Math.sin(ai.heading),
+            0
+        );
+        Cesium.Cartesian3.normalize(aiDir, aiDir);
+        Cesium.Cartesian3.multiplyByScalar(aiDir, aiDist, aiDir);
+        
+        const aiCarto = Cesium.Cartographic.fromCartesian(ai.position);
+        aiCarto.longitude += (aiDir.x / 6378137) / Math.cos(aiCarto.latitude);
+        aiCarto.latitude += aiDir.y / 6378137;
+        ai.position = Cesium.Cartesian3.fromRadians(aiCarto.longitude, aiCarto.latitude, aiCarto.height);
+        
+        // TCAS calculations
+        const distanceToTraffic = Cesium.Cartesian3.distance(state.position, ai.position);
+        const altDiff = Math.abs(carto.height - aiCarto.height) * 3.28084;
+        
+        if (distanceToTraffic < 4000 && altDiff < 2000) {
+            playWarning("Traffic. Traffic.");
+        }
+        if (distanceToTraffic < 1500 && altDiff < 1000) {
+            const myAlt = carto.height;
+            const aiAlt = aiCarto.height;
+            if (myAlt < aiAlt) {
+                 playWarning("Descend. Descend.", true);
+            } else {
+                 playWarning("Climb. Climb.", true);
+            }
+        }
+
+        // --- GPWS & RAAS Logic ---
+        const aglMeters = carto.height - (viewer.scene.globe.getHeight(carto) || 0);
+        const aglFeet = aglMeters * 3.28084;
+        const vspeedMetersPerSec = (carto.height - gpwsState.current.lastHeight) / dt;
+        const vspeedFpm = vspeedMetersPerSec * 196.85;
+        gpwsState.current.lastHeight = carto.height;
+
+        const gpws = gpwsState.current;
+        
+        // RAAS - Approaching runway (Dummy check for SFO runway 28R vicinity)
+        if (!gpws.hasApproachedRunway && aglFeet < 1500 && aglFeet > 500 && vspeedFpm < -500) {
+             const sfoDist = Cesium.Cartesian3.distance(state.position, Cesium.Cartesian3.fromDegrees(-122.38, 37.62, 0));
+             if (sfoDist < 10000) {
+                 playWarning("Approaching Runway Two Eight Right");
+                 gpws.hasApproachedRunway = true;
+             }
+        }
+
+        if (state.velocity > 30) {
+            // Stall Warning
+            if (isStalling) {
+                 const now = performance.now();
+                 if (now - gpws.stallTriggered > 2000) {
+                     playWarning("Stall! Stall!", true);
+                     gpws.stallTriggered = now;
+                 }
+                 // Add massive buffeting to camera due to turbulent airflow
+                 camControls.current.panTilt += (Math.random() - 0.5) * 0.05;
+                 camControls.current.orbitAlpha += (Math.random() - 0.5) * 0.02;
+            }
+
+            // Sink Rate
+            if (aglFeet < 2500 && vspeedFpm < -2000) {
+                 const now = performance.now();
+                 if (now - gpws.sinkRateTriggered > 3000) {
+                     playWarning("Sink Rate.");
+                     gpws.sinkRateTriggered = now;
+                 }
+            }
+            if (aglFeet < 1000 && vspeedFpm < -3500) {
+                 playWarning("Pull Up! Pull Up!", true);
+            }
+
+            // Terrain Warning
+            if (aglFeet < 500 && vspeedFpm < -500 && !animationsEnabledRef.current) { // Assuming animations = gear
+                 playWarning("Too Low, Gear.");
+            } else if (aglFeet < 300 && spd > 200) {
+                 playWarning("Too Low, Terrain.");
+            }
+
+            // Radio Altimeter Callouts
+            if (vspeedFpm < -200) { // Only call out when descending
+                if (aglFeet <= 2500 && !gpws.called2500) { playWarning("Twenty Five Hundred"); gpws.called2500 = true; }
+                if (aglFeet <= 1000 && !gpws.called1000) { playWarning("One Thousand"); gpws.called1000 = true; }
+                if (aglFeet <= 500 && !gpws.called500) { playWarning("Five Hundred"); gpws.called500 = true; }
+                if (aglFeet <= 400 && !gpws.called400) { playWarning("Four Hundred"); gpws.called400 = true; }
+                if (aglFeet <= 300 && !gpws.called300) { playWarning("Three Hundred"); gpws.called300 = true; }
+                if (aglFeet <= 200 && !gpws.called200) { playWarning("Two Hundred"); gpws.called200 = true; }
+                if (aglFeet <= 100 && !gpws.called100) { playWarning("One Hundred"); gpws.called100 = true; }
+                if (aglFeet <= 50 && !gpws.called50) { playWarning("Fifty"); gpws.called50 = true; }
+                if (aglFeet <= 40 && !gpws.called40) { playWarning("Forty"); gpws.called40 = true; }
+                if (aglFeet <= 30 && !gpws.called30) { playWarning("Thirty"); gpws.called30 = true; }
+                if (aglFeet <= 20 && !gpws.called20) { playWarning("Twenty. Retard. Retard."); gpws.called20 = true; }
+                if (aglFeet <= 10 && !gpws.called10) { playWarning("Ten"); gpws.called10 = true; }
+            }
+        }
+        
+        // Reset callouts if we climb back up
+        if (aglFeet > 2600) gpws.called2500 = false;
+        if (aglFeet > 1100) gpws.called1000 = false;
+        if (aglFeet > 600) gpws.called500 = false;
+        if (aglFeet > 500) gpws.called400 = false;
+        if (aglFeet > 400) gpws.called300 = false;
+        if (aglFeet > 300) gpws.called200 = false;
+        if (aglFeet > 200) gpws.called100 = false;
+        if (aglFeet > 150) {
+            gpws.called50 = false; gpws.called40 = false; gpws.called30 = false; gpws.called20 = false; gpws.called10 = false;
+        }
+        if (aglFeet > 3000) gpws.hasApproachedRunway = false;
 
         updateAudio(throttleRef.current, spd);
 
@@ -466,9 +820,36 @@ export default function FlightSimulator() {
                // Lift the focal point up so we don't look at the human's feet
                const zOffset = new Cesium.Cartesian3(0, 0, 1.5);
                const centerTransform = Cesium.Matrix4.multiplyByTranslation(transform, zOffset, new Cesium.Matrix4());
-               v.camera.lookAtTransform(centerTransform, offset);
+               
+               const camPos = Cesium.Matrix4.multiplyByPoint(centerTransform, offset, new Cesium.Cartesian3());
+               // Camera ground clip fix
+               const camCarto = Cesium.Cartographic.fromCartesian(camPos);
+               const ground = v.scene.globe.getHeight(camCarto) ?? 0;
+               if (camCarto.height < ground + 0.5) camCarto.height = ground + 0.5;
+               
+               v.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+               v.camera.setView({
+                   destination: Cesium.Cartesian3.fromRadians(camCarto.longitude, camCarto.latitude, camCarto.height),
+                   orientation: {
+                     direction: Cesium.Cartesian3.normalize(Cesium.Cartesian3.subtract(Cesium.Matrix4.getTranslation(centerTransform, new Cesium.Cartesian3()), Cesium.Cartesian3.fromRadians(camCarto.longitude, camCarto.latitude, camCarto.height), new Cesium.Cartesian3()), new Cesium.Cartesian3()),
+                     up: Cesium.Cartesian3.normalize(camPos, new Cesium.Cartesian3())
+                   }
+               });
+
             } else {
-               v.camera.lookAtTransform(transform, offset);
+               const camPos = Cesium.Matrix4.multiplyByPoint(transform, offset, new Cesium.Cartesian3());
+               const camCarto = Cesium.Cartographic.fromCartesian(camPos);
+               const ground = v.scene.globe.getHeight(camCarto) ?? 0;
+               if (camCarto.height < ground + 2) camCarto.height = ground + 2;
+               
+               v.camera.lookAtTransform(Cesium.Matrix4.IDENTITY);
+               v.camera.setView({
+                   destination: Cesium.Cartesian3.fromRadians(camCarto.longitude, camCarto.latitude, camCarto.height),
+                   orientation: {
+                      direction: Cesium.Cartesian3.normalize(Cesium.Cartesian3.subtract(pos, Cesium.Cartesian3.fromRadians(camCarto.longitude, camCarto.latitude, camCarto.height), new Cesium.Cartesian3()), new Cesium.Cartesian3()),
+                      up: Cesium.Cartesian3.normalize(camPos, new Cesium.Cartesian3())
+                   }
+               });
             }
          } else {
             let baseOffset;
@@ -488,11 +869,11 @@ export default function FlightSimulator() {
          }
       };
 
-      viewer.clock.onTick.addEventListener(onTick);
+      viewer.scene.preUpdate.addEventListener(onTick);
       
       return () => {
         if (viewer && !viewer.isDestroyed()) {
-          viewer.clock.onTick.removeEventListener(onTick);
+          viewer.scene.preUpdate.removeEventListener(onTick);
         }
         canvas.removeEventListener('mousedown', onMouseDown);
         window.removeEventListener('mouseup', onMouseUp);

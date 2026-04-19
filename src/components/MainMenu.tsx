@@ -42,7 +42,7 @@ export default function MainMenu() {
     <>
       <label className="block text-[11px] text-[#94a3b8] uppercase tracking-[1px] mb-[10px]">Select Aircraft</label>
       <select 
-        className="w-full bg-[rgba(15,25,35,0.8)] border border-white/10 p-[10px] rounded-[4px] mb-[20px] text-[13px] text-white outline-none focus:border-[#26b3ff]"
+        className="w-full bg-[rgba(15,25,35,0.8)] border border-white/10 p-[10px] rounded-[4px] mb-[10px] text-[13px] text-white outline-none focus:border-[#26b3ff]"
         value={selectedAircraft}
         onChange={(e) => {
            setSelectedAircraft(e.target.value);
@@ -56,15 +56,22 @@ export default function MainMenu() {
         ))}
         {customModelUrl && <option value="Custom">Custom GLB Model</option>}
       </select>
+      
+      {selectedAircraft !== 'Custom' && !customModelUrl && (
+         <div className="text-[11px] text-[#fbbf24] bg-[#fbbf24]/10 p-[8px] rounded border border-[#fbbf24]/20 mb-[20px]">
+           <strong>Note:</strong> Currently using the default generic placeholder 3D model. To fly a physically accurate visual model, please import a custom .GLB or .GLTF file below.
+         </div>
+      )}
 
-      <div className="bg-[rgba(15,25,35,0.8)] p-[15px] rounded-[4px] mb-[20px] border border-white/10 flex flex-col gap-4">
-        <label className="flex items-center gap-[10px] cursor-pointer text-[#94a3b8] hover:text-[#26b3ff] transition text-[13px]">
-          <UploadCloud size={16} />
-          <span>Import Custom .GLB Aircraft Model from Device</span>
+      <div className="bg-[#1e293b] p-[20px] rounded-[8px] mb-[20px] border border-[#26b3ff]/50 shadow-[0_0_15px_rgba(38,179,255,0.1)] flex flex-col gap-4 relative overflow-hidden">
+        <div className="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[#26b3ff] to-transparent"></div>
+        <label className="flex items-center justify-center gap-[15px] cursor-pointer bg-[#26b3ff]/10 hover:bg-[#26b3ff]/20 text-[#26b3ff] py-[15px] rounded-[6px] transition border border-[#26b3ff]/30 font-bold tracking-wide">
+          <UploadCloud size={20} />
+          <span>IMPORT CUSTOM .GLB / .GLTF AIRCRAFT MODEL</span>
           <input type="file" accept=".glb,.gltf" className="hidden" onChange={handleFileUpload} />
         </label>
-        <div className="flex border-t border-white/5 pt-4 flex-col gap-2">
-          <span className="text-[#94a3b8] text-[13px]">Or link directly to an online model (e.g. FlightGear models converted to GLB on GitHub):</span>
+        <div className="flex border-t border-white/10 pt-4 flex-col gap-2">
+          <span className="text-[#94a3b8] text-[12px]">Or link directly to an online model URL (e.g. FlightGear models converted to GLB):</span>
           <input 
             type="text" 
             placeholder="https://example.com/model.glb" 
@@ -114,7 +121,7 @@ export default function MainMenu() {
       </nav>
 
       <div className="absolute top-[100px] left-[300px] right-[40px] bottom-[100px] grid grid-cols-[2fr_1fr] gap-[20px]">
-        <div className="bg-[rgba(255,255,255,0.05)] border border-white/10 relative flex flex-col justify-end p-[30px] overflow-y-auto">
+        <div className="bg-[rgba(255,255,255,0.05)] border border-white/10 relative flex flex-col justify-start p-[30px] overflow-y-auto">
           {activeTab === 'free' && (
             <>
               <div className="text-[48px] font-[100] leading-none mb-6">FREE FLIGHT</div>
@@ -122,7 +129,7 @@ export default function MainMenu() {
               {renderAircraftSelection()}
 
               <label className="block text-[11px] text-[#94a3b8] uppercase tracking-[1px] mb-[10px] flex items-center gap-[6px]"><MapIcon size={14} /> Departure / Arrival</label>
-              <div className="grid grid-cols-2 gap-[15px] mt-auto">
+              <div className="grid grid-cols-2 gap-[15px] mb-4">
                  <input type="text" placeholder="ICAO (e.g. KSFO)" className="bg-[rgba(15,25,35,0.8)] border border-white/10 p-[10px] rounded-[4px] text-[13px] text-white outline-none focus:border-[#26b3ff]" defaultValue="KSFO" />
                  <input type="text" placeholder="ICAO (e.g. KJFK)" className="bg-[rgba(15,25,35,0.8)] border border-white/10 p-[10px] rounded-[4px] text-[13px] text-white outline-none focus:border-[#26b3ff]" />
               </div>
@@ -136,7 +143,7 @@ export default function MainMenu() {
               
               {renderAircraftSelection()}
 
-              <div className="grid grid-cols-2 gap-4 mt-auto">
+              <div className="grid grid-cols-2 gap-4 mb-4">
                  {[
                    { id: 'engine_failure', title: 'Engine Flameout', desc: 'Thrust drops to 0 mid-flight.' },
                    { id: 'ailerons_failure', title: 'Aileron Lock', desc: 'Roll control effectiveness reduced by 90%.' },
@@ -165,9 +172,11 @@ export default function MainMenu() {
               <div className="text-[48px] font-[100] leading-none mb-6 flex items-center gap-4"><GraduationCap size={40} /> CAREER MODE</div>
               <p className="text-[14px] text-[#94a3b8] mb-[20px]">Progress through official licensing. Pass practical exams to unlock heavier aircraft.</p>
               
-              {renderAircraftSelection()}
+              <div className="mb-4">
+                 {renderAircraftSelection()}
+              </div>
 
-              <div className="flex flex-col gap-[15px] mt-auto">
+              <div className="flex flex-col gap-[15px] mb-4">
                  {['SPL (Student) - Solo Prep', 'PPL (Private) - Navigation Test', 'CPL (Commercial) - IFR Checkride', 'ATPL (Airline Transport)'].map((level, idx) => {
                    const key = level.split(' ')[0] as CareerMode;
                    const isActive = careerState === key;
@@ -212,7 +221,7 @@ export default function MainMenu() {
                         useFlightStore.getState().setSpawnMode('gate');
                         startFlight();
                      }}
-                     className="bg-[#26b3ff] text-black font-black p-[15px] rounded border-none hover:bg-[#1a9fe6] uppercase tracking-[2px] text-center mt-auto"
+                     className="bg-[#26b3ff] text-black font-black p-[15px] rounded border-none hover:bg-[#1a9fe6] uppercase tracking-[2px] text-center mb-4"
               >
                     ENTER RAMP / GATE
               </button>
@@ -222,20 +231,24 @@ export default function MainMenu() {
           {activeTab === 'settings' && (
             <>
               <div className="text-[48px] font-[100] leading-none mb-6 flex items-center gap-4"><Settings size={40} /> SETTINGS</div>
-              <div className="space-y-[15px] mt-auto">
+              <div className="space-y-[15px] mb-4">
                 <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
-                   <span>Real-time Weather & Ray Tracing (Simulated)</span>
+                   <span>X-Plane 12 Cinematic HDR & SSAO Lighting</span>
                    <input type="checkbox" defaultChecked className="w-[16px] h-[16px] accent-[#26b3ff]" />
                 </div>
                 <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
-                   <span>VR Mode Compatible</span>
+                   <span>Real-time Weather & Global Illumination</span>
                    <input type="checkbox" defaultChecked className="w-[16px] h-[16px] accent-[#26b3ff]" />
                 </div>
                 <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
-                   <span>Map Provider</span>
+                   <span>VR Headset (WebXR) Compatible</span>
+                   <input type="checkbox" defaultChecked className="w-[16px] h-[16px] accent-[#26b3ff]" />
+                </div>
+                <div className="flex items-center justify-between bg-[rgba(15,25,35,0.8)] p-[15px] rounded border border-white/10 text-[13px] text-[#94a3b8]">
+                   <span>Maps & Photogrammetry Provider</span>
                    <select className="bg-[rgba(0,0,0,0.5)] border border-white/20 p-[5px] rounded text-white outline-none">
-                      <option>OpenStreetMap</option>
-                      <option>Bing Maps (Fallback)</option>
+                      <option>OpenStreetMap (Default)</option>
+                      <option>Bing Maps Aerial</option>
                    </select>
                 </div>
               </div>

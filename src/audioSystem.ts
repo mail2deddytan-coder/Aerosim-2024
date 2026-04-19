@@ -4,6 +4,32 @@ let engineGain: GainNode | null = null;
 let windFilter: BiquadFilterNode | null = null;
 let windGain: GainNode | null = null;
 
+let lastSpokenMessage = "";
+let lastSpokenTime = 0;
+
+export const playWarning = (message: string, force: boolean = false) => {
+   const now = performance.now();
+   // Prevent spamming the same warning too often unless forced
+   if (!force && message === lastSpokenMessage && now - lastSpokenTime < 3000) return;
+   
+   if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel(); // Interrupt current
+      const utterance = new SpeechSynthesisUtterance(message);
+      utterance.rate = 1.1;
+      utterance.pitch = 0.8;
+      utterance.volume = 1.0;
+      // Try to find a synthetic/male voice if possible
+      const voices = window.speechSynthesis.getVoices();
+      const roboticVoice = voices.find(v => v.name.toLowerCase().includes('google') || v.name.toLowerCase().includes('robot') || v.name.toLowerCase().includes('male'));
+      if (roboticVoice) {
+         utterance.voice = roboticVoice;
+      }
+      window.speechSynthesis.speak(utterance);
+      lastSpokenMessage = message;
+      lastSpokenTime = now;
+   }
+};
+
 export const initAudio = () => {
   if (audioCtx) return;
   try {
