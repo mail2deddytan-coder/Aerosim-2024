@@ -41,8 +41,12 @@ export default function FlightSimulator() {
        ? Cesium.Cartesian3.fromDegrees(-122.38, 37.62, 5000)
        : (spawnMode === 'gate' ? Cesium.Cartesian3.fromDegrees(-122.381, 37.618, 5) : Cesium.Cartesian3.fromDegrees(-122.38, 37.62, 5)),
     heading: 0,
-    pitchAngle: 0,
+    pitchAngle: spawnMode === 'air' ? 0.05 : 0, // Approx 3 degrees pitch up at start so it doesn't sink wildly 
     rollAngle: 0,
+    pitchRate: 0,
+    rollRate: 0,
+    yawRate: 0,
+    vSpeed: 0,
   });
 
   const humanState = useRef({
@@ -633,10 +637,6 @@ export default function FlightSimulator() {
            setWarningMessage(warning);
         }
         
-        const turnRate = 1.0 * dt; // Increased turn rate for more agile loops/rolls
-        state.pitchAngle -= effPitch * turnRate; // Push forward -> nose down -> negative pitch
-        state.rollAngle += effRoll * turnRate; // Right -> positive roll -> right wing down
-        
         // Wrap roll angle to -PI and PI
         if (state.rollAngle > Math.PI) state.rollAngle -= 2 * Math.PI;
         if (state.rollAngle < -Math.PI) state.rollAngle += 2 * Math.PI;
@@ -645,68 +645,116 @@ export default function FlightSimulator() {
         if (state.pitchAngle > Math.PI) state.pitchAngle -= 2 * Math.PI;
         if (state.pitchAngle < -Math.PI) state.pitchAngle += 2 * Math.PI;
         
-        if (isTouchingGround) {
-             // Ground steering overrides air steering
-             state.heading += fbw.smoothedYawInput * turnRate; 
-        } else {
-             // Turn plane heading based on current bank angle for natural turning
-             state.heading += Math.sin(state.rollAngle) * Math.cos(state.pitchAngle) * 1.5 * dt;
-             // Allow secondary yaw/rudder in air
-             state.heading += fbw.smoothedYawInput * turnRate * 0.5;
-        }
-        
         // Wrap heading
         if (state.heading > Math.PI) state.heading -= 2 * Math.PI;
         if (state.heading < -Math.PI) state.heading += 2 * Math.PI;
         
-        // --- Fly-By-Wire Auto-Leveling ---
-        if (!apEnabledRef.current) {
-            const autoLevelRate = 2.0 * dt; 
-            
-            // If joystick released horizontally, auto-level roll
-            if (Math.abs(ctrl.rollInput) < 0.05) {
-                state.rollAngle -= state.rollAngle * autoLevelRate;
-            } else {
-                state.rollAngle -= state.rollAngle * 0.005; // standard tiny air resistance
-            }
-
-            // If joystick released vertically, auto-level pitch to horizon
-            if (Math.abs(ctrl.pitchInput) < 0.05) {
-                state.pitchAngle -= state.pitchAngle * autoLevelRate;
-            } else {
-                state.pitchAngle -= state.pitchAngle * 0.005; 
-            }
-        }
-        
-        const thrustAccel = currentThrust / specs.mass;
         const velocitySq = state.velocity * state.velocity;
         
-        // AoA depends roughly on pitch relative to flight path, simplified here using pitch directly
-        const { drag } = calculateForces(velocitySq, state.pitchAngle * (180/Math.PI), specs);
-        const dragDecel = drag / specs.mass;
-        const gravity = 9.81 * Math.sin(state.pitchAngle);
+        // --- X-PLANE 12 STYLE AERODYNAMICS ---
+        // True Flight Path Angle (gamma)
+        const currentVspeed = (state as any).vSpeed || 0;
+        const flightPathAngle = Math.atan2(currentVspeed, Math.max(0.1, state.velocity));
+        
+        // Aerodynamic Angle of Attack (Nose pitch minus trajectory)
+        let dynAoA = state.pitchAngle - flightPathAngle; 
+        
+        // When there's no rudder input, the tail wants to trail the slipstream natively 
+        if (ctrl.yawInput === 0 && Math.abs(fbw.smoothedYawInput) > 0.001) {
+            fbw.smoothedYawInput -= fbw.smoothedYawInput * 2.0 * dt; 
+        }
 
-        let accel = thrustAccel - dragDecel - gravity;
+        let dynSlip = -fbw.smoothedYawInput * 0.1; 
 
-        state.velocity += accel * dt;
-        if (state.velocity < 0) state.velocity = 0;
-
-        const dist = state.velocity * dt;
-        // Cesium's Heading zero points +X (East).
-        // H rotation is around -Z (Down), so positive heading turns South (-Y).
-        // Therefore, X movement is cos(H) and Y movement is -sin(H)
-        const direction = new Cesium.Cartesian3(
-           Math.cos(state.heading) * Math.cos(state.pitchAngle),
-           -Math.sin(state.heading) * Math.cos(state.pitchAngle),
-           Math.sin(state.pitchAngle)
+        // Evaluate Aerodynamics!
+        const forces = calculateForces(
+            state.velocity, dynAoA, dynSlip,
+            { p: state.rollRate || 0, q: state.pitchRate || 0, r: state.yawRate || 0 },
+            { pitch: effPitch, roll: effRoll, yaw: fbw.smoothedYawInput },
+            specs
         );
 
+        // Rotational inertia
+        const Ixx = specs.mass * Math.pow(specs.wingSpan / 4, 2);
+        const Iyy = specs.mass * Math.pow(specs.wingSpan / 4, 2);
+        const Izz = specs.mass * Math.pow(specs.wingSpan / 3, 2);
+
+        let rollAccel = forces.rollMoment / Ixx;
+        let pitchAccel = forces.pitchMoment / Iyy;
+        const yawAccel = forces.yawMoment / Izz;
+        
+        // ARCADE FLIGHT ASSIST: Auto-Level when controls let go
+        if (!apEnabledRef.current && Math.abs(ctrl.pitchInput) < 0.01 && Math.abs(fbw.smoothedPitchInput) < 0.01) {
+            // Force pitch towards 0
+            const pitchError = 0 - state.pitchAngle;
+            // High spring force to force center, and strong dampening to prevent overshoot
+            pitchAccel += (pitchError * 15.0 - (state.pitchRate || 0) * 8.0);
+        }
+        if (!apEnabledRef.current && Math.abs(ctrl.rollInput) < 0.01 && Math.abs(fbw.smoothedRollInput) < 0.01) {
+            const rollError = 0 - state.rollAngle;
+            rollAccel += (rollError * 8.0 - (state.rollRate || 0) * 5.0);
+        }
+        
+        // Ground & Flight physics lock
+        if (isTouchingGround) {
+             state.yawRate = fbw.smoothedYawInput * 0.5;
+             state.rollRate = 0; 
+             state.pitchRate -= state.pitchAngle * 5.0 * dt; 
+             if (state.rollAngle > 0.05 || state.rollAngle < -0.05) state.rollAngle *= 0.8;
+             
+             // Ground braking / friction
+             if (state.velocity > 0 && currentThrust < 10000) state.velocity -= 2 * dt; 
+             if (currentVspeed < 0) (state as any).vSpeed = 0; 
+             
+             if (apEnabledRef.current) setApEnabled(false);
+             state.heading += state.yawRate * dt;
+        } else {
+             state.rollRate = Math.max(-3, Math.min(3, (state.rollRate || 0) + rollAccel * dt));
+             state.pitchRate = Math.max(-2, Math.min(2, (state.pitchRate || 0) + pitchAccel * dt));
+             state.yawRate = Math.max(-1.5, Math.min(1.5, (state.yawRate || 0) + yawAccel * dt));
+             
+             // Coordinated turn centripetal force mapping (Banked Lift vector driving heading change)
+             const turnRateFromBank = (9.81 / Math.max(state.velocity, 15)) * Math.tan(Math.max(-1.3, Math.min(1.3, state.rollAngle)));
+             state.heading += (turnRateFromBank + (state.yawRate || 0)) * dt;
+        }
+        
+        state.rollAngle += (state.rollRate || 0) * dt;
+        state.pitchAngle += (state.pitchRate || 0) * dt;
+        
+        // --- TRANSLATIONAL PHYSICS (LINEAR MOVEMENT) ---
+        const thrustAccel = currentThrust / specs.mass;
+        const dragDecel = forces.drag / specs.mass;
+        
+        // Forward accel is thrust - drag - gravity component
+        let accel = thrustAccel - dragDecel - 9.81 * Math.sin(flightPathAngle);
+        state.velocity += accel * dt;
+        if (state.velocity < 1 && spawn !== 'gate') state.velocity = 1;
+
+        // Vertical accel is Lift component - Gravity + Thrust component
+        let verticalLift = forces.lift * Math.cos(state.rollAngle);
+        let vertAccel = (verticalLift / specs.mass) - 9.81 + (thrustAccel * Math.sin(state.pitchAngle));
+        
+        if (isTouchingGround && vertAccel < 0) {
+            (state as any).vSpeed = 0;
+        } else {
+            (state as any).vSpeed = currentVspeed + vertAccel * dt;
+        }
+
+        // Distance & World Position Updating (Horizontal Translation)
+        const hzSpeed = state.velocity * Math.cos(flightPathAngle);
+        const hzDist = hzSpeed * dt;
+
+        const direction = new Cesium.Cartesian3(
+           Math.cos(state.heading),
+           -Math.sin(state.heading),
+           0
+        );
         Cesium.Cartesian3.normalize(direction, direction);
-        Cesium.Cartesian3.multiplyByScalar(direction, dist, direction);
+        Cesium.Cartesian3.multiplyByScalar(direction, hzDist, direction);
 
         carto.longitude += (direction.x / 6378137) / Math.cos(carto.latitude);
         carto.latitude += direction.y / 6378137;
-        carto.height += direction.z;
+        carto.height += Math.max(-500, Math.min(500, (state as any).vSpeed)) * dt;
         
         // Ensure plane doesn't tunnel through ground
         const minHeight = groundHeight + 4; // roughly gear height
@@ -1101,16 +1149,20 @@ export default function FlightSimulator() {
          <div className="pointer-events-auto flex items-center gap-[20px]">
            {spawnMode !== 'gate' ? (
              <>
-                <input 
-                  type="range" 
-                  className="h-[120px] w-[8px] !appearance-slider-vertical pointer-events-auto" 
-                  style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
-                  min="0" max="1" step="0.01" 
-                  value={throttle}
-                  onChange={(e) => setThrottle(parseFloat(e.target.value))}
-                />
-                <div className="text-[#26b3ff] text-[12px] uppercase font-bold tracking-[2px]">
-                   THRUST<br/>{Math.round(throttle * 100)}%
+                <div className="flex flex-col gap-6 items-center">
+                    <div className="flex gap-4 items-center">
+                        <input 
+                          type="range" 
+                          className="h-[120px] w-[8px] !appearance-slider-vertical pointer-events-auto" 
+                          style={{ writingMode: 'vertical-lr', direction: 'rtl' }}
+                          min="0" max="1" step="0.01" 
+                          value={throttle}
+                          onChange={(e) => setThrottle(parseFloat(e.target.value))}
+                        />
+                        <div className="text-[#26b3ff] text-[12px] uppercase font-bold tracking-[2px]">
+                           THRUST<br/>{Math.round(throttle * 100)}%
+                        </div>
+                    </div>
                 </div>
              </>
            ) : (
@@ -1127,14 +1179,18 @@ export default function FlightSimulator() {
             {spawnMode !== 'gate' && (
                <div className="flex gap-4 pr-10">
                   <button 
-                     onPointerDown={() => { controlsRef.current.yawInput = -1; }} 
-                     onPointerUp={() => { controlsRef.current.yawInput = 0; }} 
-                     className="w-[60px] h-[60px] bg-black/50 rounded-full border border-white/20 text-[#26b3ff] text-[10px] font-bold tracking-widest uppercase active:bg-[#26b3ff] active:text-white"
+                     onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); controlsRef.current.yawInput = -1; }} 
+                     onPointerUp={(e) => { e.currentTarget.releasePointerCapture(e.pointerId); controlsRef.current.yawInput = 0; }} 
+                     onPointerOut={() => { controlsRef.current.yawInput = 0; }}
+                     onPointerCancel={() => { controlsRef.current.yawInput = 0; }}
+                     className="w-[60px] h-[60px] bg-black/50 rounded-full border border-white/20 text-[#26b3ff] text-[10px] font-bold tracking-widest uppercase active:bg-[#26b3ff] active:text-white select-none"
                   >L<br/>RUD</button>
                   <button 
-                     onPointerDown={() => { controlsRef.current.yawInput = 1; }} 
-                     onPointerUp={() => { controlsRef.current.yawInput = 0; }} 
-                     className="w-[60px] h-[60px] bg-black/50 rounded-full border border-white/20 text-[#26b3ff] text-[10px] font-bold tracking-widest uppercase active:bg-[#26b3ff] active:text-white"
+                     onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); controlsRef.current.yawInput = 1; }} 
+                     onPointerUp={(e) => { e.currentTarget.releasePointerCapture(e.pointerId); controlsRef.current.yawInput = 0; }} 
+                     onPointerOut={() => { controlsRef.current.yawInput = 0; }}
+                     onPointerCancel={() => { controlsRef.current.yawInput = 0; }}
+                     className="w-[60px] h-[60px] bg-black/50 rounded-full border border-white/20 text-[#26b3ff] text-[10px] font-bold tracking-widest uppercase active:bg-[#26b3ff] active:text-white select-none"
                   >R<br/>RUD</button>
                </div>
             )}
