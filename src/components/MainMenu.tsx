@@ -5,7 +5,7 @@ import { aircraftDB } from '../flightModel';
 
 export default function MainMenu() {
   const { setAppState, setLoading, selectedAircraft, setSelectedAircraft, customModelUrl, setCustomModelUrl, careerState, setCareerState, setError } = useFlightStore();
-  const [activeTab, setActiveTab] = useState<'free' | 'career' | 'settings'>('free');
+  const [activeTab, setActiveTab] = useState<'free' | 'career' | 'settings' | 'scenarios' | 'walkaround'>('free');
 
   const startFlight = () => {
     setAppState('loading');

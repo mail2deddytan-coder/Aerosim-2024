@@ -13,11 +13,17 @@ export default function FlightSimulator() {
   const [throttle, setThrottle] = useState(0);
   const [speedKnots, setSpeedKnots] = useState(0);
   const [altitude, setAltitude] = useState(0);
+  const [fpm, setFpm] = useState(0);
   const [hasAnimations, setHasAnimations] = useState(false);
   const [animationsEnabled, setAnimationsEnabled] = useState(false);
   const [timeOfDay, setTimeOfDay] = useState(12); // Noon
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
+  const [atcMessage, setAtcMessage] = useState<string | null>(null);
+  const [apEnabled, setApEnabled] = useState(false);
+
+  const apEnabledRef = useRef(false);
+  const apState = useRef({ targetAlt: 5000, targetSpd: 250, targetHdg: 0 });
   
   const handleAudioInit = () => {
     if (!audioEnabled) {
@@ -96,12 +102,19 @@ export default function FlightSimulator() {
     yawInput: 0
   });
 
+  const fbwState = useRef({
+    smoothedPitchInput: 0,
+    smoothedRollInput: 0,
+    smoothedYawInput: 0
+  });
+
   const aircraftEntity = useRef<Cesium.Entity | null>(null);
 
   const throttleRef = useRef(throttle);
   const cameraViewRef = useRef(cameraView);
   const animationsEnabledRef = useRef(animationsEnabled);
   const timeOfDayRef = useRef(timeOfDay);
+  const warningFlagRef = useRef<string | null>(null);
 
   const camControls = useRef({
     orbitAlpha: 0,
@@ -114,6 +127,7 @@ export default function FlightSimulator() {
   useEffect(() => { throttleRef.current = throttle; }, [throttle]);
   useEffect(() => { animationsEnabledRef.current = animationsEnabled; }, [animationsEnabled]);
   useEffect(() => { timeOfDayRef.current = timeOfDay; }, [timeOfDay]);
+  useEffect(() => { apEnabledRef.current = apEnabled; }, [apEnabled]);
   useEffect(() => { 
     cameraViewRef.current = cameraView;
     if (cameraView === 'exterior') {
@@ -149,16 +163,21 @@ export default function FlightSimulator() {
     const init = async () => {
       viewer = new Cesium.Viewer(viewerRef.current!, {
         vrButton: true,
-        baseLayerPicker: true,
+        baseLayerPicker: false,
         animation: false,
         timeline: false,
         fullscreenButton: true,
         navigationHelpButton: false,
+        infoBox: false,
+        selectionIndicator: false,
       });
 
-      // Enable Lighting for Day/Night cycle
+      // Enable Fog & Lighting for Day/Night cycle
       viewer.scene.globe.enableLighting = true;
       viewer.scene.globe.depthTestAgainstTerrain = true;
+      viewer.scene.fog.enabled = true;
+      viewer.scene.fog.density = 0.0005; // Noticeable fog
+      viewer.scene.fog.screenSpaceErrorFactor = 2.0;
 
       try {
         viewer.terrainProvider = await Cesium.createWorldTerrainAsync();
@@ -169,11 +188,15 @@ export default function FlightSimulator() {
       if (!isMounted || !viewer) return;
 
       try {
-         // Create beautiful satellite aerial imagery instead of OSM streets
-         const imagery = await Cesium.createWorldImageryAsync({
-            style: Cesium.IonWorldImageryStyle.AERIAL_WITH_LABELS
-         });
-         viewer.imageryLayers.addImageryProvider(imagery);
+         viewer.imageryLayers.removeAll();
+         try {
+             const arcGisImagery = await Cesium.ArcGisMapServerImageryProvider.fromUrl(
+                 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer'
+             );
+             viewer.imageryLayers.addImageryProvider(arcGisImagery);
+         } catch (e) {
+             console.warn('ArcGIS Imagery failed:', e);
+         }
 
          // Add 3D buildings for realism
          const buildingsTileset = await Cesium.createOsmBuildingsAsync();
@@ -182,94 +205,119 @@ export default function FlightSimulator() {
          console.warn('Failed to load imagery or buildings:', e);
       }
 
-      const specs = aircraftDB[selectedAircraft] || aircraftDB['Boeing 737'];
+      try {
+         // Add Volumetric Clouds
+         const clouds = new Cesium.CloudCollection({
+             noiseDetail: 16.0
+         });
+         viewer.scene.primitives.add(clouds);
 
-      let modelUri = customModelUrl;
-      if (!modelUri) {
-        // Fallback to a built-in remote model
-        modelUri = 'https://sandcastle.cesium.com/SampleData/models/CesiumAir/Cesium_Air.glb';
+         // Scatter clouds across a massive area around the Bay Area
+         for (let i = 0; i < 300; i++) {
+             const lon = -122.38 + (Math.random() - 0.5) * 5; // Wide area
+             const lat = 37.62 + (Math.random() - 0.5) * 5;
+             const height = 1500 + Math.random() * 2000; // 1.5km to 3.5km high
+             
+             clouds.add({
+                 position: Cesium.Cartesian3.fromDegrees(lon, lat, height),
+                 scale: new Cesium.Cartesian2(Math.random() * 2000 + 1500, Math.random() * 1000 + 500),
+                 maximumSize: new Cesium.Cartesian3(Math.random() * 3000 + 2000, Math.random() * 3000 + 2000, Math.random() * 1000 + 500),
+                 slice: Math.random()
+             });
+         }
+      } catch (e) {
+         console.warn('Failed to add volumetric clouds:', e);
       }
 
-      aircraftEntity.current = viewer.entities.add({
-        name: selectedAircraft,
-        // @ts-ignore
-        position: new Cesium.CallbackProperty(() => simState.current.position, false),
-        orientation: new Cesium.CallbackProperty(() => {
-          const { heading, pitchAngle, rollAngle } = simState.current;
-          const hpr = new Cesium.HeadingPitchRoll(heading, pitchAngle, rollAngle);
-          return Cesium.Transforms.headingPitchRollQuaternion(simState.current.position, hpr);
-        }, false),
-        model: {
-          uri: modelUri,
+      const specs = aircraftDB[selectedAircraft] || aircraftDB['Boeing 737'];
+
+      // Always rely on the built-in box graphic as a fallback or primary if no valid model URL exists
+      const modelConfig = customModelUrl ? {
+          uri: customModelUrl,
           minimumPixelSize: 128,
           maximumScale: 20000,
           runAnimations: new Cesium.CallbackProperty(() => animationsEnabledRef.current, false) as unknown as boolean,
-        }
-      });
+      } : undefined;
 
-      // Spawn AI Traffic
-      viewer.entities.add({
-         name: "AI Traffic",
-         // @ts-ignore
-         position: new Cesium.CallbackProperty(() => aiTrafficState.current.position, false),
-         orientation: new Cesium.CallbackProperty(() => {
-            const hpr = new Cesium.HeadingPitchRoll(aiTrafficState.current.heading, 0, 0);
-            return Cesium.Transforms.headingPitchRollQuaternion(aiTrafficState.current.position, hpr);
-         }, false),
-         model: {
-            uri: 'https://sandcastle.cesium.com/SampleData/models/CesiumAir/Cesium_Air.glb',
-            minimumPixelSize: 64,
-            maximumScale: 10000,
-         }
-      });
+      try {
+        aircraftEntity.current = viewer.entities.add({
+          name: selectedAircraft,
+          // @ts-ignore
+          position: new Cesium.CallbackProperty(() => simState.current.position, false),
+          orientation: new Cesium.CallbackProperty(() => {
+            const { heading, pitchAngle, rollAngle } = simState.current;
+            const hpr = new Cesium.HeadingPitchRoll(heading, pitchAngle, rollAngle);
+            return Cesium.Transforms.headingPitchRollQuaternion(simState.current.position, hpr);
+          }, false),
+          model: modelConfig
+        });
+      } catch (e) {
+         console.error('Failed to add aircraft entity:', e);
+      }
 
-      if (spawnMode === 'gate') {
+      try {
+         // Spawn AI Traffic
          viewer.entities.add({
-            name: 'Human Avatar',
+            name: "AI Traffic",
             // @ts-ignore
-            position: new Cesium.CallbackProperty(() => humanState.current.position, false),
+            position: new Cesium.CallbackProperty(() => aiTrafficState.current.position, false),
             orientation: new Cesium.CallbackProperty(() => {
-               const hpr = new Cesium.HeadingPitchRoll(humanState.current.heading, 0, 0);
-               return Cesium.Transforms.headingPitchRollQuaternion(humanState.current.position, hpr);
+               const hpr = new Cesium.HeadingPitchRoll(aiTrafficState.current.heading, 0, 0);
+               return Cesium.Transforms.headingPitchRollQuaternion(aiTrafficState.current.position, hpr);
             }, false),
-            model: {
-               // A built-in standard Cesium character model
-               uri: 'https://sandcastle.cesium.com/SampleData/models/CesiumMan/Cesium_Man.glb',
-               minimumPixelSize: 32,
-               maximumScale: 1,
-               runAnimations: new Cesium.CallbackProperty(() => Math.abs(humanState.current.velocity) > 0.1, false) as unknown as boolean,
+            box: {
+               dimensions: new Cesium.Cartesian3(10.0, 10.0, 3.0),
+               material: Cesium.Color.YELLOW.withAlpha(0.8),
             }
          });
+      } catch (e) {
+         console.warn('Failed to spawn AI traffic:', e);
+      }
 
-         // Add moving ground vehicles
-         groundVehiclesState.current.forEach((vehicle, index) => {
-             viewer?.entities.add({
-                name: `Ground Vehicle ${index + 1}`,
-                // @ts-ignore
-                position: new Cesium.CallbackProperty(() => groundVehiclesState.current[index].position, false),
-                orientation: new Cesium.CallbackProperty(() => {
-                   const hpr = new Cesium.HeadingPitchRoll(groundVehiclesState.current[index].heading, 0, 0);
-                   return Cesium.Transforms.headingPitchRollQuaternion(groundVehiclesState.current[index].position, hpr);
-                }, false),
-                model: {
-                   uri: 'https://sandcastle.cesium.com/SampleData/models/CesiumMilkTruck/CesiumMilkTruck.glb',
-                   minimumPixelSize: 64,
-                   maximumScale: 1,
-                   runAnimations: true,
-                   heightReference: Cesium.HeightReference.CLAMP_TO_GROUND
-                }
-             });
-         });
+      try {
+         if (spawnMode === 'gate') {
+            viewer.entities.add({
+               name: 'Human Avatar',
+               // @ts-ignore
+               position: new Cesium.CallbackProperty(() => humanState.current.position, false),
+               orientation: new Cesium.CallbackProperty(() => {
+                  const hpr = new Cesium.HeadingPitchRoll(humanState.current.heading, 0, 0);
+                  return Cesium.Transforms.headingPitchRollQuaternion(humanState.current.position, hpr);
+               }, false),
+               cylinder: {
+                  length: 1.8,
+                  topRadius: 0.3,
+                  bottomRadius: 0.3,
+                  material: Cesium.Color.WHITE
+               }
+            });
 
-         // Add a row of street lights along the ramp
-         for (let i = 0; i < 5; i++) {
-             // Add post for street light
-             viewer.entities.add({
-                name: `Light Post ${i + 1}`,
-                position: Cesium.Cartesian3.fromDegrees(-122.3811 + (i * 0.0003), 37.6180, 2.5),
-                cylinder: {
-                   length: 5.0,
-                   topRadius: 0.1,
+            // Add moving ground vehicles
+            groundVehiclesState.current.forEach((vehicle, index) => {
+                viewer?.entities.add({
+                   name: `Ground Vehicle ${index + 1}`,
+                   // @ts-ignore
+                   position: new Cesium.CallbackProperty(() => groundVehiclesState.current[index].position, false),
+                   orientation: new Cesium.CallbackProperty(() => {
+                      const hpr = new Cesium.HeadingPitchRoll(groundVehiclesState.current[index].heading, 0, 0);
+                      return Cesium.Transforms.headingPitchRollQuaternion(groundVehiclesState.current[index].position, hpr);
+                   }, false),
+                   box: {
+                      dimensions: new Cesium.Cartesian3(4.0, 2.0, 2.0),
+                      material: Cesium.Color.ORANGE
+                   }
+                });
+            });
+
+            // Add a row of street lights along the ramp
+            for (let i = 0; i < 5; i++) {
+                // Add post for street light
+                viewer.entities.add({
+                   name: `Light Post ${i + 1}`,
+                   position: Cesium.Cartesian3.fromDegrees(-122.3811 + (i * 0.0003), 37.6180, 2.5),
+                   cylinder: {
+                      length: 5.0,
+                      topRadius: 0.1,
                    bottomRadius: 0.1,
                    material: Cesium.Color.fromCssColorString('#444444'),
                    heightReference: Cesium.HeightReference.RELATIVE_TO_GROUND
@@ -290,6 +338,9 @@ export default function FlightSimulator() {
                 }
              });
          }
+      }
+      } catch (e) {
+         console.warn('Failed to load gate entities:', e);
       }
 
       // --- Animation Checker ---
@@ -398,6 +449,15 @@ export default function FlightSimulator() {
          }
       };
 
+      const onKeyDown = (e: KeyboardEvent) => {
+          if (e.key === 'q' || e.key === 'Q') controlsRef.current.yawInput = -1;
+          if (e.key === 'e' || e.key === 'E') controlsRef.current.yawInput = 1;
+      };
+      
+      const onKeyUp = (e: KeyboardEvent) => {
+          if (['q', 'Q', 'e', 'E'].includes(e.key)) controlsRef.current.yawInput = 0;
+      };
+
       viewer.scene.screenSpaceCameraController.enableInputs = false;
 
       canvas.addEventListener('mousedown', onMouseDown);
@@ -407,6 +467,8 @@ export default function FlightSimulator() {
       canvas.addEventListener('touchstart', onTouchStart, { passive: true });
       window.addEventListener('touchend', onTouchEnd);
       window.addEventListener('touchmove', onTouchMove, { passive: true });
+      window.addEventListener('keydown', onKeyDown);
+      window.addEventListener('keyup', onKeyUp);
 
       let lastTime = performance.now();
 
@@ -414,7 +476,7 @@ export default function FlightSimulator() {
         if (!viewer || viewer.isDestroyed()) return;
 
         const now = performance.now();
-        const dt = (now - lastTime) / 1000;
+        const dt = Math.min((now - lastTime) / 1000, 0.1); // Cap dt to 0.1s to prevent physics explosions
         lastTime = now;
 
         const state = simState.current;
@@ -500,10 +562,46 @@ export default function FlightSimulator() {
            return;
         }
 
-        // --- Emergency Modifiers ---
+        // --- Emergency Modifiers & Fly-By-Wire ---
+        const fbw = fbwState.current;
+        const fbwSmoothing = 5.0 * dt; // FBW input damping speed
+        
+        fbw.smoothedPitchInput += (ctrl.pitchInput - fbw.smoothedPitchInput) * fbwSmoothing;
+        fbw.smoothedRollInput += (ctrl.rollInput - fbw.smoothedRollInput) * fbwSmoothing;
+        fbw.smoothedYawInput += (ctrl.yawInput - fbw.smoothedYawInput) * fbwSmoothing;
+        
         let currentThrust = throttleRef.current * specs.thrust;
-        let effPitch = ctrl.pitchInput;
-        let effRoll = ctrl.rollInput;
+        let effPitch = fbw.smoothedPitchInput;
+        let effRoll = fbw.smoothedRollInput;
+        
+        const carto = Cesium.Cartographic.fromCartesian(state.position);
+        const groundHeight = viewer.scene.globe.getHeight(carto) ?? 0;
+        const isTouchingGround = carto.height <= groundHeight + 6;
+
+        // --- Autopilot & Autothrottle ---
+        if (apEnabledRef.current && !isTouchingGround) {
+            // Autothrottle
+            const currentKnots = state.velocity * 1.94384;
+            const spdError = apState.current.targetSpd - currentKnots;
+            // Calculate a synthetic throttle position
+            let apThrottle = throttleRef.current + (spdError * 0.01 * dt);
+            apThrottle = Math.max(0, Math.min(1, apThrottle));
+            throttleRef.current = apThrottle; // Override ref but not React state to avoid lag
+            currentThrust = apThrottle * specs.thrust;
+
+            // Pitch AP (Altitude Hold)
+            const currentAlt = carto.height * 3.28084;
+            const altError = apState.current.targetAlt - currentAlt;
+            const targetPitch = Math.max(-0.25, Math.min(0.25, altError * 0.0005));
+            effPitch = -(targetPitch - state.pitchAngle) * 2.0; // Negative because pitchInput pushes nose down
+
+            // Roll AP (Heading Hold)
+            const hdgError = apState.current.targetHdg - state.heading;
+            const nHdgError = Math.atan2(Math.sin(hdgError), Math.cos(hdgError)); // Normalize -PI to PI
+            const targetRoll = Math.max(-0.5, Math.min(0.5, nHdgError * 1.0));
+            effRoll = (targetRoll - state.rollAngle) * 2.0;
+        }
+
         let warning = null;
         let alarmVolume = 0;
 
@@ -530,7 +628,8 @@ export default function FlightSimulator() {
             warning = '✅ CHECKRIDE EXAM: FOLLOW ATC INSTRUCTIONS';
         }
 
-        if (warningMessage !== warning) {
+        if (warningFlagRef.current !== warning) {
+           warningFlagRef.current = warning;
            setWarningMessage(warning);
         }
         
@@ -546,17 +645,38 @@ export default function FlightSimulator() {
         if (state.pitchAngle > Math.PI) state.pitchAngle -= 2 * Math.PI;
         if (state.pitchAngle < -Math.PI) state.pitchAngle += 2 * Math.PI;
         
-        // Turn plane heading based on current bank angle for natural turning
-        // Use Math.sin(rollAngle) so it turns fastest at 90deg bank, and doesn't turn when upside down (180deg)
-        state.heading += Math.sin(state.rollAngle) * Math.cos(state.pitchAngle) * 1.5 * dt;
+        if (isTouchingGround) {
+             // Ground steering overrides air steering
+             state.heading += fbw.smoothedYawInput * turnRate; 
+        } else {
+             // Turn plane heading based on current bank angle for natural turning
+             state.heading += Math.sin(state.rollAngle) * Math.cos(state.pitchAngle) * 1.5 * dt;
+             // Allow secondary yaw/rudder in air
+             state.heading += fbw.smoothedYawInput * turnRate * 0.5;
+        }
         
         // Wrap heading
         if (state.heading > Math.PI) state.heading -= 2 * Math.PI;
         if (state.heading < -Math.PI) state.heading += 2 * Math.PI;
         
-        // Minimal air resistance/damping so controls aren't entirely loose
-        state.rollAngle -= state.rollAngle * 0.005; // tiny damping
-        state.pitchAngle -= state.pitchAngle * 0.005; 
+        // --- Fly-By-Wire Auto-Leveling ---
+        if (!apEnabledRef.current) {
+            const autoLevelRate = 2.0 * dt; 
+            
+            // If joystick released horizontally, auto-level roll
+            if (Math.abs(ctrl.rollInput) < 0.05) {
+                state.rollAngle -= state.rollAngle * autoLevelRate;
+            } else {
+                state.rollAngle -= state.rollAngle * 0.005; // standard tiny air resistance
+            }
+
+            // If joystick released vertically, auto-level pitch to horizon
+            if (Math.abs(ctrl.pitchInput) < 0.05) {
+                state.pitchAngle -= state.pitchAngle * autoLevelRate;
+            } else {
+                state.pitchAngle -= state.pitchAngle * 0.005; 
+            }
+        }
         
         const thrustAccel = currentThrust / specs.mass;
         const velocitySq = state.velocity * state.velocity;
@@ -584,13 +704,9 @@ export default function FlightSimulator() {
         Cesium.Cartesian3.normalize(direction, direction);
         Cesium.Cartesian3.multiplyByScalar(direction, dist, direction);
 
-        const carto = Cesium.Cartographic.fromCartesian(state.position);
         carto.longitude += (direction.x / 6378137) / Math.cos(carto.latitude);
         carto.latitude += direction.y / 6378137;
         carto.height += direction.z;
-
-        // Fetch ground height to prevent clipping
-        const groundHeight = viewer.scene.globe.getHeight(carto) ?? 0;
         
         // Ensure plane doesn't tunnel through ground
         const minHeight = groundHeight + 4; // roughly gear height
@@ -603,6 +719,8 @@ export default function FlightSimulator() {
             // Apply heavy ground friction if we aren't producing lifting speed
             if (state.velocity > 0) state.velocity -= 2 * dt; 
             if (state.velocity < 0) state.velocity = 0;
+            // Turn off AP on touchdown
+            if (apEnabledRef.current) setApEnabled(false);
         }
 
         // Ground physics lock
@@ -662,6 +780,8 @@ export default function FlightSimulator() {
         const vspeedMetersPerSec = (carto.height - gpwsState.current.lastHeight) / dt;
         const vspeedFpm = vspeedMetersPerSec * 196.85;
         gpwsState.current.lastHeight = carto.height;
+        
+        setFpm(Math.round(vspeedFpm));
 
         const gpws = gpwsState.current;
         
@@ -723,6 +843,19 @@ export default function FlightSimulator() {
             gpws.called50 = false; gpws.called40 = false; gpws.called30 = false; gpws.called20 = false; gpws.called10 = false;
         }
         if (aglFeet > 3000) gpws.hasApproachedRunway = false;
+
+        // --- ATC Logic ---
+        if (now % 20000 < 100) { // Random ATC chatter roughly every 20s
+             const messages = [
+                 "Flight 402, maintain current heading and altitude.",
+                 "Caution, wake turbulence reported from heavy ahead.",
+                 "Contact NorCal Approach on 120.5, good day.",
+                 "Traffic 2 o'clock, 5 miles, Boeing 737.",
+                 "Altimeter 29.92, wind is calm."
+             ];
+             setAtcMessage(`ATC: ${messages[Math.floor(Math.random() * messages.length)]}`);
+             setTimeout(() => setAtcMessage(null), 5000);
+        }
 
         updateAudio(throttleRef.current, spd);
 
@@ -817,6 +950,8 @@ export default function FlightSimulator() {
     let cleanup = () => {};
     init().then(cleanupFn => {
       if (cleanupFn) cleanup = cleanupFn;
+    }).catch(e => {
+        console.error("FATAL CESIUM INIT ERROR:", e);
     });
 
     return () => {
@@ -852,7 +987,10 @@ export default function FlightSimulator() {
   };
 
   return (
-    <div className="absolute inset-0 bg-[#05070a] font-['Helvetica_Neue',Helvetica,Arial,sans-serif] text-white">
+    <div 
+      className="absolute inset-0 bg-[#05070a] font-['Helvetica_Neue',Helvetica,Arial,sans-serif] text-white select-none [-webkit-touch-callout:none]"
+      onContextMenu={(e) => e.preventDefault()}
+    >
       <div ref={viewerRef} className="w-full h-full" onClick={handleAudioInit} />
       
       {/* Viewport Overlay for Cameras */}
@@ -873,6 +1011,22 @@ export default function FlightSimulator() {
                className="mt-4 bg-[rgba(38,179,255,0.2)] border border-[#26b3ff] text-[#26b3ff] px-[12px] py-[8px] text-[11px] font-bold cursor-pointer text-right uppercase shadow-[0_0_10px_rgba(38,179,255,0.3)] transition hover:bg-[rgba(38,179,255,0.3)]"
            >
               {animationsEnabled ? 'STOP ANIM / RAIS. GEAR' : 'PLAY ANIM / DEPL. GEAR'}
+           </button>
+        )}
+
+        {spawnMode !== 'gate' && (
+           <button 
+               onClick={() => {
+                   if (!apEnabled) {
+                       apState.current.targetAlt = altitude;
+                       apState.current.targetSpd = speedKnots;
+                       apState.current.targetHdg = simState.current.heading;
+                   }
+                   setApEnabled(!apEnabled);
+               }}
+               className={`mt-4 border px-[12px] py-[8px] text-[11px] font-bold cursor-pointer text-right uppercase transition ${apEnabled ? 'bg-green-500/30 border-green-500 text-green-500' : 'bg-white/10 border-white/20 text-white/50 hover:bg-white/20'}`}
+           >
+              {apEnabled ? 'AUTOPILOT ENGAGED' : 'ENGAGE AUTOPILOT'}
            </button>
         )}
       </div>
@@ -923,10 +1077,19 @@ export default function FlightSimulator() {
                 <span className="text-[10px] text-[#94a3b8] uppercase">Fuel LBS</span>
                 <span className="font-['Courier_New',Courier,monospace] text-[24px] text-[#26b3ff]">42,500</span>
               </div>
+              <div className="flex flex-col">
+                <span className="text-[10px] text-[#94a3b8] uppercase">VSPEED (FPM)</span>
+                <span className="font-['Courier_New',Courier,monospace] text-[24px] text-[#26b3ff]">{fpm > 0 ? `+${fpm}` : fpm}</span>
+              </div>
             </div>
             {warningMessage && (
               <div className={`px-[20px] py-[10px] font-bold text-[14px] uppercase tracking-[2px] animate-pulse ${warningMessage.includes('✅') ? 'bg-[#22c55e]/20 border border-[#22c55e] text-[#22c55e]' : 'bg-red-500/20 border border-red-500 text-red-500'}`}>
                   {warningMessage}
+              </div>
+            )}
+            {atcMessage && (
+              <div className="px-[20px] py-[10px] font-bold text-[14px] uppercase tracking-[2px] bg-[#26b3ff]/20 border border-[#26b3ff] text-[#26b3ff]">
+                  {atcMessage}
               </div>
             )}
         </div>
@@ -951,23 +1114,40 @@ export default function FlightSimulator() {
                 </div>
              </>
            ) : (
-                <div className="text-[#26b3ff] flex flex-col gap-1 text-[12px] uppercase font-bold tracking-[2px] bg-black/50 p-4 rounded border border-white/10">
-                   <span>🕹️ JOYSTICK UP/DOWN → Move Person</span>
-                   <span>🕹️ JOYSTICK LEFT/RIGHT → Turn Person</span>
+               <div className="text-[#26b3ff] flex flex-col gap-1 text-[12px] uppercase font-bold tracking-[2px] bg-black/50 p-4 rounded border border-white/10">
+                   <span>🕹️ JOYSTICK UP/DOWN → Main Pitch</span>
+                   <span>🕹️ JOYSTICK LEFT/RIGHT → Main Roll</span>
+                   <span>⌨️ 'Q' / 'E' KEYS → Ground Steering Rudder</span>
                    <span>🖱️ CLICK & DRAG → View Camera</span>
                 </div>
            )}
          </div>
 
-         <div className="pointer-events-auto relative">
-            <div className="absolute inset-0 border-2 border-white/20 rounded-full bg-[radial-gradient(circle,rgba(255,255,255,0.05),transparent)] pointer-events-none shadow-[inset_0_0_10px_rgba(255,255,255,0.1)]"></div>
-            <Joystick 
-              size={120} 
-              baseColor="transparent" 
-              stickColor="#26b3ff" 
-              move={handleJoystickMove} 
-              stop={handleJoystickStop} 
-            />
+         <div className="pointer-events-auto relative flex items-center justify-end gap-6 w-[400px]">
+            {spawnMode !== 'gate' && (
+               <div className="flex gap-4 pr-10">
+                  <button 
+                     onPointerDown={() => { controlsRef.current.yawInput = -1; }} 
+                     onPointerUp={() => { controlsRef.current.yawInput = 0; }} 
+                     className="w-[60px] h-[60px] bg-black/50 rounded-full border border-white/20 text-[#26b3ff] text-[10px] font-bold tracking-widest uppercase active:bg-[#26b3ff] active:text-white"
+                  >L<br/>RUD</button>
+                  <button 
+                     onPointerDown={() => { controlsRef.current.yawInput = 1; }} 
+                     onPointerUp={() => { controlsRef.current.yawInput = 0; }} 
+                     className="w-[60px] h-[60px] bg-black/50 rounded-full border border-white/20 text-[#26b3ff] text-[10px] font-bold tracking-widest uppercase active:bg-[#26b3ff] active:text-white"
+                  >R<br/>RUD</button>
+               </div>
+            )}
+            <div className="relative">
+               <div className="absolute inset-0 border-2 border-[#26b3ff]/30 rounded-full bg-[radial-gradient(circle,rgba(38,179,255,0.1),transparent)] pointer-events-none shadow-[inset_0_0_15px_rgba(38,179,255,0.2)]"></div>
+               <Joystick 
+                 size={120} 
+                 baseColor="transparent" 
+                 stickColor="#26b3ff" 
+                 move={handleJoystickMove} 
+                 stop={handleJoystickStop} 
+               />
+            </div>
          </div>
       </div>
     </div>
