@@ -4,7 +4,7 @@ import { Plane, Map as MapIcon, GraduationCap, Video, UploadCloud, Settings, Pla
 import { aircraftDB } from '../flightModel';
 
 export default function MainMenu() {
-  const { setAppState, setLoading, selectedAircraft, setSelectedAircraft, customModelUrl, setCustomModelUrl, careerState, setCareerState, setError } = useFlightStore();
+  const { setAppState, setLoading, selectedAircraft, setSelectedAircraft, customModelUrl, setCustomModelUrl, modelYawOffset, setModelYawOffset, modelPitchOffset, setModelPitchOffset, modelRollOffset, setModelRollOffset, careerState, setCareerState, setError, weatherFog, setWeatherFog, spawnMode, setSpawnMode, turbulenceEnabled, setTurbulence, invertY, setInvertY } = useFlightStore();
   const [activeTab, setActiveTab] = useState<'free' | 'career' | 'settings' | 'scenarios' | 'walkaround'>('free');
 
   const startFlight = () => {
@@ -71,17 +71,17 @@ export default function MainMenu() {
           <input type="file" accept=".glb,.gltf" className="hidden" onChange={handleFileUpload} />
         </label>
         <div className="flex border-t border-white/10 pt-4 flex-col gap-2">
-          <span className="text-[#94a3b8] text-[12px]">Or link directly to an online model URL (e.g. FlightGear models converted to GLB):</span>
+          <span className="text-[#94a3b8] text-[12px]">Or link directly to an online GLB model URL:</span>
           <input 
             type="text" 
             placeholder="https://example.com/model.glb" 
             className="bg-[rgba(0,0,0,0.5)] border border-white/10 p-[10px] rounded-[4px] text-[13px] text-white outline-none focus:border-[#26b3ff] w-full"
             value={customModelUrl || ''}
-            onChange={(e) => {
+              onChange={(e) => {
               const val = e.target.value.trim();
               setCustomModelUrl(val || null);
               if (val) setSelectedAircraft('Custom');
-              else setSelectedAircraft('Boeing 737');
+              else setSelectedAircraft('Boeing 777');
             }}
           />
         </div>
@@ -127,6 +127,56 @@ export default function MainMenu() {
               <div className="text-[48px] font-[100] leading-none mb-6">FREE FLIGHT</div>
               
               {renderAircraftSelection()}
+
+              <label className="block text-[11px] text-[#94a3b8] uppercase tracking-[1px] mb-[10px] flex items-center gap-[6px]"><MapIcon size={14} /> Spawn Location</label>
+              <div className="grid grid-cols-3 gap-[15px] mb-6">
+                {['air', 'runway', 'gate'].map((mode) => (
+                    <button 
+                       key={mode}
+                       onClick={() => setSpawnMode(mode as any)}
+                       className={`p-[10px] rounded border text-center uppercase text-[12px] transition ${spawnMode === mode ? 'bg-[#26b3ff]/20 border-[#26b3ff] text-[#26b3ff] font-bold' : 'bg-[rgba(15,25,35,0.8)] border-white/10 text-white hover:bg-[rgba(255,255,255,0.05)]'}`}
+                    >
+                       {mode}
+                    </button>
+                ))}
+              </div>
+
+              <label className="block text-[11px] text-[#94a3b8] uppercase tracking-[1px] mb-[10px] flex items-center gap-[6px]">Weather & Fog</label>
+              <div className="bg-[rgba(15,25,35,0.8)] border border-white/10 p-[15px] rounded-[4px] mb-[20px] flex flex-col gap-4">
+                 <div>
+                     <div className="flex justify-between text-[12px] mb-2">
+                        <span className="text-[#94a3b8]">Clear</span>
+                        <span className="text-[#94a3b8]">Dense Fog</span>
+                     </div>
+                     <input 
+                        type="range" 
+                        min="0" 
+                        max="1" 
+                        step="0.05"
+                        value={weatherFog}
+                        onChange={(e) => setWeatherFog(parseFloat(e.target.value))}
+                        className="w-full accent-[#26b3ff]"
+                     />
+                 </div>
+                 <div className="flex items-center justify-between">
+                     <span className="text-[12px] text-[#94a3b8]">Air Turbulence</span>
+                     <button 
+                        onClick={() => setTurbulence(!turbulenceEnabled)}
+                        className={`px-3 py-1 text-[11px] uppercase rounded border transition ${turbulenceEnabled ? 'bg-[#26b3ff]/20 border-[#26b3ff] text-[#26b3ff]' : 'bg-transparent border-white/20 text-white/50 hover:bg-white/5'}`}
+                     >
+                         {turbulenceEnabled ? 'Enabled' : 'Disabled'}
+                     </button>
+                 </div>
+                 <div className="flex items-center justify-between">
+                     <span className="text-[12px] text-[#94a3b8]">Invert Y-Axis (Pitch)</span>
+                     <button 
+                        onClick={() => setInvertY(!invertY)}
+                        className={`px-3 py-1 text-[11px] uppercase rounded border transition ${invertY ? 'bg-[#26b3ff]/20 border-[#26b3ff] text-[#26b3ff]' : 'bg-transparent border-white/20 text-white/50 hover:bg-white/5'}`}
+                     >
+                         {invertY ? 'Inverted' : 'Normal'}
+                     </button>
+                 </div>
+              </div>
 
               <label className="block text-[11px] text-[#94a3b8] uppercase tracking-[1px] mb-[10px] flex items-center gap-[6px]"><MapIcon size={14} /> Departure / Arrival</label>
               <div className="grid grid-cols-2 gap-[15px] mb-4">

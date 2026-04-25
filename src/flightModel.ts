@@ -22,57 +22,73 @@ export const aircraftDB: Record<string, AircraftSpecs> = {
   'Custom': { name: 'Custom', mass: 65000, wingArea: 125, wingSpan: 34.3, thrust: 240000, oswaldEfficiency: 0.82 },
 };
 
-function getAirfoilCoefficients(alphaRad: number, symmetrical: boolean = false): { cl: number, cd: number } {
+function getAirfoilCoefficients(alphaRad: number, symmetrical: boolean = false): { cl: number, cd: number, cm: number } {
   const alphaDeg = alphaRad * (180 / Math.PI);
   const absAlphaDeg = Math.abs(alphaDeg);
   
-  const cdMin = 0.015;
-  const a0 = 2 * Math.PI; // Lift curve slope
+  const cdMin = symmetrical ? 0.010 : 0.015;
+  const a0 = symmetrical ? 2 * Math.PI : 6.0; // Lift curve slope approx 2*pi
   
-  // NATIVE CAMBER: Commercial jets have cambered wings! They produce lift at 0 degrees Angle of Attack
-  // A symmetrical airfoil (like a tail) produces 0 lift at 0 Angle of Attack.
+  // NATIVE CAMBER
   const zeroLiftAlphaRad = symmetrical ? 0 : -2.5 * (Math.PI / 180);
   
-  // Attached flow region (Linear Lift, Quadratic Profile Drag)
+  // Attached flow region
   const clAttached = a0 * (alphaRad - zeroLiftAlphaRad);
-  // Profile parasitic drag 
+  // Profile drag
   const cdAttached = cdMin + 0.005 * Math.pow(alphaDeg / 10, 2); 
+  // Pitch moment (NACA profile baseline)
+  const cmAttached = symmetrical ? 0 : -0.06 - 0.01 * (alphaDeg / 10);
 
-  // Separated flow region (Deep Stall Plate approximation)
-  const clFlatPlate = 1.1 * Math.sin(2 * alphaRad);
+  // Separated flow region (Post-stall Flat Plate)
+  const sign = Math.sign(alphaRad);
+  const clFlatPlate = 1.1 * sign * Math.pow(Math.sin(alphaRad), 2) * Math.cos(alphaRad) + 0.5 * Math.sin(2 * alphaRad);
   const cdFlatPlate = 1.2 * (1 - Math.cos(2 * alphaRad));
+  const cmFlatPlate = symmetrical ? 0 : -0.2 * sign;
 
-  // Sigmoid blend based on critical stall angle margin
-  const stallAngleDeg = symmetrical ? 12.0 : 15.0; // Symmetrical airfoils usually stall sooner
+  // Real stall modeling (Stall onset and sharp drop)
+  const stallAngleDeg = symmetrical ? 12.0 : 15.0;
+  let stallMultiplier = 1.0;
+  if (!symmetrical && absAlphaDeg > stallAngleDeg && absAlphaDeg < stallAngleDeg + 5) {
+      // Lift drops sharply right after stall
+      stallMultiplier = Math.max(0.4, 1.0 - (absAlphaDeg - stallAngleDeg) * 0.15);
+  }
+
+  // Sigmoid blend attached vs separated
   const blendSharpness = 0.8;
   const stallMargin = absAlphaDeg - stallAngleDeg;
-  
-  // 0 = completely attached, 1 = completely separated
   const separatedWeight = 1.0 / (1.0 + Math.exp(-blendSharpness * stallMargin));
   
-  const cl = clAttached * (1 - separatedWeight) + clFlatPlate * separatedWeight;
+  const cl = (clAttached * stallMultiplier) * (1 - separatedWeight) + clFlatPlate * separatedWeight;
   const cd = cdAttached * (1 - separatedWeight) + cdFlatPlate * separatedWeight;
+  const cm = cmAttached * (1 - separatedWeight) + cmFlatPlate * separatedWeight;
   
-  return { cl, cd };
+  return { cl, cd, cm };
 }
 
-export function calculateForces(velocity: number, aoaRad: number, slipRad: number, rates: {p: number, q: number, r: number}, controls: {pitch: number, roll: number, yaw: number}, specs: AircraftSpecs, airDensity: number = 1.225) {
-  // X-Plane 12 Physics Engine Core: Blade Element Theory across all aerodynamic surfaces
-  // Evaluates Wing, Horizontal Tail, and Vertical Tail independently with induced downwash and propwash coupling.
-  
+export function calculateForces(velocity: number, aoaRad: number, slipRad: number, rates: {p: number, q: number, r: number}, controls: {pitch: number, roll: number, yaw: number}, specs: AircraftSpecs, airDensity: number = 1.225, altitudeAGL: number = 1000) {
+  // X-Plane 12+ / FlightGear Style Core: Blade Element Theory across all aerodynamic surfaces
   const span = specs.wingSpan;
+  const meanChord = specs.wingArea / span;
   const velocitySq = Math.max(0.1, velocity * velocity);
   const baseVelocity = Math.sqrt(velocitySq);
   
+  // Ground Effect Modifications
+  // K_ge scales induced drag down, Lift cushion scales lift up
+  const h_over_b = Math.max(0.01, altitudeAGL / span);
+  const K_ge = (16 * Math.pow(h_over_b, 2)) / (1 + 16 * Math.pow(h_over_b, 2));
+  const h_over_c = Math.max(0.1, altitudeAGL / meanChord);
+  const liftCushion = altitudeAGL < span ? 1 + 0.15 / (h_over_c) : 1.0;
+
   // Induced Flow (Downwash) Angle
   const AR = (span * span) / specs.wingArea;
   const e = specs.oswaldEfficiency;
-  const inducedAngleFactor = (2 / (AR * e)) / (1 + 2 / (AR * e));
+  // Reduce induced angle due to ground effect
+  const inducedAngleFactor = (2 / (AR * e)) / (1 + 2 / (AR * e)) * K_ge;
   const alpha_i = aoaRad * inducedAngleFactor;
   const alpha_eff = aoaRad - alpha_i;
 
   let stallRatio = baseVelocity < 15.0 ? baseVelocity / 15.0 : 1.0;
-  const { cl: clZerospeed, cd: cdZerospeed } = getAirfoilCoefficients(0);
+  const { cl: clZerospeed, cd: cdZerospeed, cm: cmZerospeed } = getAirfoilCoefficients(0);
 
   // Geometric assumptions for Empennage (Tail) based on typical airliner ratios
   const htArea = specs.wingArea * 0.2;
@@ -81,7 +97,7 @@ export function calculateForces(velocity: number, aoaRad: number, slipRad: numbe
   const vtArm = span * 0.45;
 
   // 1. MAIN WING BET Evaluation
-  const evaluateWingElement = (y: number): [number, number, number, number] => {
+  const evaluateWingElement = (y: number): [number, number, number, number, number] => {
     const normalizedY = (2 * y) / span;
     const chord = (4 * specs.wingArea) / (Math.PI * span) * Math.sqrt(Math.max(0, 1 - normalizedY * normalizedY));
     
@@ -97,16 +113,21 @@ export function calculateForces(velocity: number, aoaRad: number, slipRad: numbe
     }
 
     let localElementAoA = alpha_eff + dampAoA + aileronAoA;
-    let { cl, cd } = getAirfoilCoefficients(localElementAoA);
+    let { cl, cd, cm } = getAirfoilCoefficients(localElementAoA);
     
+    // Ground effect lift increase
+    cl *= liftCushion;
+
     if (stallRatio < 1.0) {
        cl = cl * stallRatio + clZerospeed * (1 - stallRatio);
        cd = cd * stallRatio + cdZerospeed * (1 - stallRatio);
+       cm = cm * stallRatio + cmZerospeed * (1 - stallRatio);
     }
 
     const localQ = 0.5 * airDensity * velocitySq;
     const dL_2D = localQ * chord * cl;
     const dD_2D = localQ * chord * cd;
+    const dM_2D = localQ * (chord * chord) * cm;
     
     // 3D vector shift for exact induced drag
     const dL_3D = dL_2D * Math.cos(alpha_i) - dD_2D * Math.sin(alpha_i);
@@ -117,13 +138,13 @@ export function calculateForces(velocity: number, aoaRad: number, slipRad: numbe
     // Adverse Yaw (Right wing drag -> nose right -> positive yaw)
     const dYaw = dD_3D * y; 
 
-    return [dL_3D, dD_3D, dRoll, dYaw];
+    return [dL_3D, dD_3D, dRoll, dYaw, dM_2D];
   };
 
   const adaptiveSimpsons = (
     a: number, b: number, eps: number, maxD: number, d: number, 
-    fa: [number, number, number, number], fm: [number, number, number, number], fb: [number, number, number, number]
-  ): [number, number, number, number] => {
+    fa: [number, number, number, number, number], fm: [number, number, number, number, number], fb: [number, number, number, number, number]
+  ): [number, number, number, number, number] => {
     const m = (a + b) / 2;
     const h = b - a;
     
@@ -136,53 +157,68 @@ export function calculateForces(velocity: number, aoaRad: number, slipRad: numbe
       (step / 6) * (wA[0] + 4 * wM[0] + wB[0]),
       (step / 6) * (wA[1] + 4 * wM[1] + wB[1]),
       (step / 6) * (wA[2] + 4 * wM[2] + wB[2]),
-      (step / 6) * (wA[3] + 4 * wM[3] + wB[3])
+      (step / 6) * (wA[3] + 4 * wM[3] + wB[3]),
+      (step / 6) * (wA[4] + 4 * wM[4] + wB[4])
     ];
 
     const S = calc(fa, fm, fb, h);
     const Sleft = calc(fa, fm1, fm, h/2);
     const Sright = calc(fm, fm2, fb, h/2);
-    const S2: [number,number,number,number] = [Sleft[0]+Sright[0], Sleft[1]+Sright[1], Sleft[2]+Sright[2], Sleft[3]+Sright[3]];
+    const S2: [number,number,number,number,number] = [Sleft[0]+Sright[0], Sleft[1]+Sright[1], Sleft[2]+Sright[2], Sleft[3]+Sright[3], Sleft[4]+Sright[4]];
 
     if (d >= maxD || Math.abs(S2[0]-S[0]) <= 15*eps) {
-       return [S2[0]+(S2[0]-S[0])/15, S2[1]+(S2[1]-S[1])/15, S2[2]+(S2[2]-S[2])/15, S2[3]+(S2[3]-S[3])/15];
+       return [S2[0]+(S2[0]-S[0])/15, S2[1]+(S2[1]-S[1])/15, S2[2]+(S2[2]-S[2])/15, S2[3]+(S2[3]-S[3])/15, S2[4]+(S2[4]-S[4])/15];
     }
     const LRes = adaptiveSimpsons(a, m, eps/2, maxD, d+1, fa, fm1, fm);
     const RRes = adaptiveSimpsons(m, b, eps/2, maxD, d+1, fm, fm2, fb);
-    return [LRes[0]+RRes[0], LRes[1]+RRes[1], LRes[2]+RRes[2], LRes[3]+RRes[3]];
+    return [LRes[0]+RRes[0], LRes[1]+RRes[1], LRes[2]+RRes[2], LRes[3]+RRes[3], LRes[4]+RRes[4]];
   };
 
   const wingRes = adaptiveSimpsons(-span/2, span/2, 1.0, 8, 0, evaluateWingElement(-span/2), evaluateWingElement(0), evaluateWingElement(span/2));
 
-  let totalLift = wingRes[0];
-  let totalDrag = wingRes[1];
+  // FLAPS: Provide baseline lift boost (deploy dynamically ideally, but statically 1.35x here)
+  const flapsLiftMultiplier = 1.35;
+  let totalLift = wingRes[0] * flapsLiftMultiplier;
+  let totalDrag = wingRes[1] * (flapsLiftMultiplier * 1.5); 
   let rollMoment = -wingRes[2]; 
   let yawMoment = wingRes[3];
+  
+  // Center of Gravity offset (to create natural pitch stability dCm/dalpha)
+  // Distance from aerodynamic center to CG. Positive means CG is ahead (stable)
+  const cgOffset = meanChord * 0.1; 
+  let wingPitchMoment = wingRes[4] - (totalLift * cgOffset); // Base airfoil Cm - torque from lift behind CG (nose down)
 
   // 2. HORIZONTAL STABILIZER
-  // Downwash hits horizontal tail, pitch rate creates dampening
-  const tailAoA = aoaRad - alpha_i * 2.0; 
-  const tailDownVel = rates.q * htArm; // Upward pitch rate means tail goes DOWN (-Z relative) => upward relative wind => positive AoA
+  // Downwash hits horizontal tail, modified by ground effect
+  const downwashModifier = 1.0 - 0.5 * (1.0 - K_ge); // Downwash reduces near ground
+  const tailAoA = aoaRad - (alpha_i * 2.0 * downwashModifier); 
+  const tailDownVel = rates.q * htArm; 
   const pitchDampAoA = Math.atan2(tailDownVel, baseVelocity);
-  const elevatorAoA = controls.pitch * 20 * (Math.PI / 180); 
   
-  // NATIVE INCIDENCE ANGLE: Set to 0 to prevent uncontrollable pitching up. The aerodynamic stability will naturally push nose down at high AoA.
-  const htIncidence = 0;
+  // Control surface speed-based effectiveness (Hydraulic pressure + slipstream)
+  // At very low speeds, controls are less effective. At high speeds, they stiffen.
+  const dynamicPressureScale = Math.min(1.0, Math.max(0.1, velocitySq / 3000));
+  const elevatorAoA = controls.pitch * 20 * (Math.PI / 180) * dynamicPressureScale; 
+  
+  // Built-in tail incidence angle to naturally counteract the nose-down moment from the wing/CG
+  const htIncidence = -2.0 * (Math.PI / 180); 
 
   let localHtAoA = tailAoA + pitchDampAoA + elevatorAoA + htIncidence;
-  let htCoefs = getAirfoilCoefficients(localHtAoA, true); // true = tail uses symmetrical airfoil (zero camber)
+  let htCoefs = getAirfoilCoefficients(localHtAoA, true); 
   const htQ = 0.5 * airDensity * velocitySq;
   totalLift += htQ * htArea * htCoefs.cl;
   totalDrag += htQ * htArea * htCoefs.cd;
-  let pitchMoment = -(htQ * htArea * htCoefs.cl) * htArm;
+  
+  // Add tail pitch moment to total pitch moment
+  let pitchMoment = wingPitchMoment - (htQ * htArea * htCoefs.cl) * htArm;
 
   // 3. VERTICAL STABILIZER & RUDDER
-  const tailSideVel = rates.r * vtArm; // Rightward yaw rate means tail goes LEFT (-Y) => rightward relative wind => positive localVtAoA
+  const tailSideVel = rates.r * vtArm; 
   const yawDampAoA = Math.atan2(tailSideVel, baseVelocity);
-  const rudderAoA = -controls.yaw * 25 * (Math.PI / 180); 
+  const rudderAoA = -controls.yaw * 25 * (Math.PI / 180) * dynamicPressureScale; 
   
   let localVtAoA = slipRad + yawDampAoA + rudderAoA;
-  let vtCoefs = getAirfoilCoefficients(localVtAoA, true); // true = symmetrical airfoil
+  let vtCoefs = getAirfoilCoefficients(localVtAoA, true); 
   const vtSideForce = htQ * vtArea * vtCoefs.cl; 
   totalDrag += htQ * vtArea * htCoefs.cd;
   

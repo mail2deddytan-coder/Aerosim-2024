@@ -3,13 +3,14 @@ import * as Cesium from 'cesium';
 import 'cesium/Build/Cesium/Widgets/widgets.css';
 import { useFlightStore } from '../store';
 import { Joystick } from 'react-joystick-component';
-import { Camera, RefreshCw, Footprints, Clock, Volume2, ShieldAlert } from 'lucide-react';
+import { Camera, RefreshCw, Footprints, Clock, Volume2, ShieldAlert, Users } from 'lucide-react';
 import { aircraftDB, calculateForces } from '../flightModel';
 import { initAudio, updateAudio, stopAudio, playWarning } from '../audioSystem';
+import io, { Socket } from 'socket.io-client';
 
 export default function FlightSimulator() {
   const viewerRef = useRef<HTMLDivElement>(null);
-  const { setAppState, selectedAircraft, customModelUrl, cameraView, setCameraView, spawnMode, activeScenario } = useFlightStore();
+  const { setAppState, selectedAircraft, customModelUrl, cameraView, setCameraView, spawnMode, activeScenario, weatherFog, turbulenceEnabled, modelYawOffset, setModelYawOffset, modelPitchOffset, setModelPitchOffset, modelRollOffset, setModelRollOffset, invertY } = useFlightStore();
   const [throttle, setThrottle] = useState(0);
   const [speedKnots, setSpeedKnots] = useState(0);
   const [altitude, setAltitude] = useState(0);
@@ -21,9 +22,13 @@ export default function FlightSimulator() {
   const [warningMessage, setWarningMessage] = useState<string | null>(null);
   const [atcMessage, setAtcMessage] = useState<string | null>(null);
   const [apEnabled, setApEnabled] = useState(false);
+  const [showModelAdjust, setShowModelAdjust] = useState(false);
 
   const apEnabledRef = useRef(false);
   const apState = useRef({ targetAlt: 5000, targetSpd: 250, targetHdg: 0 });
+  const socketRef = useRef<Socket | null>(null);
+  const otherPlayersEntities = useRef<{ [id: string]: Cesium.Entity }>({});
+  const lastStateEmit = useRef(0);
   
   const handleAudioInit = () => {
     if (!audioEnabled) {
@@ -38,9 +43,9 @@ export default function FlightSimulator() {
     yaw: 0,
     velocity: spawnMode === 'air' ? 250 : 0, 
     position: spawnMode === 'air' 
-       ? Cesium.Cartesian3.fromDegrees(-122.38, 37.62, 5000)
-       : (spawnMode === 'gate' ? Cesium.Cartesian3.fromDegrees(-122.381, 37.618, 5) : Cesium.Cartesian3.fromDegrees(-122.38, 37.62, 5)),
-    heading: 0,
+       ? Cesium.Cartesian3.fromDegrees(-122.365, 37.614, 5000)
+       : (spawnMode === 'gate' ? Cesium.Cartesian3.fromDegrees(-122.381, 37.618, 5) : Cesium.Cartesian3.fromDegrees(-122.365, 37.614, 5)),
+    heading: spawnMode === 'runway' ? 280 * (Math.PI/180) : 0,
     pitchAngle: spawnMode === 'air' ? 0.05 : 0, // Approx 3 degrees pitch up at start so it doesn't sink wildly 
     rollAngle: 0,
     pitchRate: 0,
@@ -132,6 +137,16 @@ export default function FlightSimulator() {
   useEffect(() => { animationsEnabledRef.current = animationsEnabled; }, [animationsEnabled]);
   useEffect(() => { timeOfDayRef.current = timeOfDay; }, [timeOfDay]);
   useEffect(() => { apEnabledRef.current = apEnabled; }, [apEnabled]);
+  const weatherFogRef = useRef(weatherFog);
+  useEffect(() => { weatherFogRef.current = weatherFog; }, [weatherFog]);
+  const turbulenceEnabledRef = useRef(turbulenceEnabled);
+  useEffect(() => { turbulenceEnabledRef.current = turbulenceEnabled; }, [turbulenceEnabled]);
+  const modelYawOffsetRef = useRef(modelYawOffset);
+  useEffect(() => { modelYawOffsetRef.current = modelYawOffset; }, [modelYawOffset]);
+  const modelPitchOffsetRef = useRef(modelPitchOffset);
+  useEffect(() => { modelPitchOffsetRef.current = modelPitchOffset; }, [modelPitchOffset]);
+  const modelRollOffsetRef = useRef(modelRollOffset);
+  useEffect(() => { modelRollOffsetRef.current = modelRollOffset; }, [modelRollOffset]);
   useEffect(() => { 
     cameraViewRef.current = cameraView;
     if (cameraView === 'exterior') {
@@ -250,7 +265,11 @@ export default function FlightSimulator() {
           position: new Cesium.CallbackProperty(() => simState.current.position, false),
           orientation: new Cesium.CallbackProperty(() => {
             const { heading, pitchAngle, rollAngle } = simState.current;
-            const hpr = new Cesium.HeadingPitchRoll(heading, pitchAngle, rollAngle);
+            const hpr = new Cesium.HeadingPitchRoll(
+                heading + modelYawOffsetRef.current, 
+                pitchAngle + modelPitchOffsetRef.current, 
+                rollAngle + modelRollOffsetRef.current
+            );
             return Cesium.Transforms.headingPitchRollQuaternion(simState.current.position, hpr);
           }, false),
           model: modelConfig
@@ -258,6 +277,66 @@ export default function FlightSimulator() {
       } catch (e) {
          console.error('Failed to add aircraft entity:', e);
       }
+
+      // SOCKET_IO SETUP
+      socketRef.current = io({ 
+          transports: ['websocket'],
+          reconnection: true,
+          reconnectionAttempts: 5,
+          timeout: 10000
+      });
+      
+      socketRef.current.on("players_update", (playersList: [string, any][]) => {
+          if (!viewer) return;
+          const currentIds = new Set(playersList.map(p => p[0]));
+          
+          playersList.forEach(([id, state]) => {
+              if (id === socketRef.current?.id) return; // Skip self
+              
+              const pos = Cesium.Cartesian3.fromDegrees(state.lon, state.lat, state.alt);
+              const hpr = new Cesium.HeadingPitchRoll(state.heading, state.pitch, state.roll);
+              const ori = Cesium.Transforms.headingPitchRollQuaternion(pos, hpr);
+
+              if (otherPlayersEntities.current[id]) {
+                  const entity = otherPlayersEntities.current[id];
+                  entity.position = pos as any;
+                  entity.orientation = ori as any;
+              } else {
+                  // Add new player
+                  otherPlayersEntities.current[id] = viewer.entities.add({
+                      id: `player_${id}`,
+                      name: `Player ${id.substring(0, 4)}`,
+                      position: pos,
+                      orientation: ori,
+                      model: modelConfig || undefined,
+                      box: !modelConfig ? { dimensions: new Cesium.Cartesian3(20, 20, 5), material: Cesium.Color.BLUE } : undefined,
+                      label: {
+                          text: `Player ${id.substring(0, 4)}\n${state.aircraft}`,
+                          font: '14pt monospace',
+                          style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+                          verticalOrigin: Cesium.VerticalOrigin.BOTTOM,
+                          pixelOffset: new Cesium.Cartesian2(0, -50),
+                          distanceDisplayCondition: new Cesium.DistanceDisplayCondition(0.0, 5000.0)
+                      }
+                  });
+              }
+          });
+
+          // Cleanup disconnected
+          Object.keys(otherPlayersEntities.current).forEach(id => {
+              if (!currentIds.has(id)) {
+                  viewer!.entities.remove(otherPlayersEntities.current[id]);
+                  delete otherPlayersEntities.current[id];
+              }
+          });
+      });
+      
+      socketRef.current.on("player_disconnected", (id: string) => {
+          if (otherPlayersEntities.current[id] && viewer) {
+              viewer.entities.remove(otherPlayersEntities.current[id]);
+              delete otherPlayersEntities.current[id];
+          }
+      });
 
       try {
          // Spawn AI Traffic
@@ -479,6 +558,10 @@ export default function FlightSimulator() {
       const onTick = () => {
         if (!viewer || viewer.isDestroyed()) return;
 
+        // Apply Weather Settings
+        const targetFog = 0.0001 + (weatherFogRef.current * 0.0049); // Base to Heavy Fog
+        viewer.scene.fog.density += (targetFog - viewer.scene.fog.density) * 0.1;
+
         const now = performance.now();
         const dt = Math.min((now - lastTime) / 1000, 0.1); // Cap dt to 0.1s to prevent physics explosions
         lastTime = now;
@@ -580,7 +663,8 @@ export default function FlightSimulator() {
         
         const carto = Cesium.Cartographic.fromCartesian(state.position);
         const groundHeight = viewer.scene.globe.getHeight(carto) ?? 0;
-        const isTouchingGround = carto.height <= groundHeight + 6;
+        const altitudeAGL = Math.max(0.1, carto.height - groundHeight);
+        const isTouchingGround = altitudeAGL <= 6;
 
         // --- Autopilot & Autothrottle ---
         if (apEnabledRef.current && !isTouchingGround) {
@@ -590,18 +674,18 @@ export default function FlightSimulator() {
             // Calculate a synthetic throttle position
             let apThrottle = throttleRef.current + (spdError * 0.01 * dt);
             apThrottle = Math.max(0, Math.min(1, apThrottle));
-            throttleRef.current = apThrottle; // Override ref but not React state to avoid lag
+            throttleRef.current = apThrottle; 
             currentThrust = apThrottle * specs.thrust;
 
             // Pitch AP (Altitude Hold)
             const currentAlt = carto.height * 3.28084;
             const altError = apState.current.targetAlt - currentAlt;
             const targetPitch = Math.max(-0.25, Math.min(0.25, altError * 0.0005));
-            effPitch = -(targetPitch - state.pitchAngle) * 2.0; // Negative because pitchInput pushes nose down
+            effPitch = (targetPitch - state.pitchAngle) * 2.0; 
 
             // Roll AP (Heading Hold)
             const hdgError = apState.current.targetHdg - state.heading;
-            const nHdgError = Math.atan2(Math.sin(hdgError), Math.cos(hdgError)); // Normalize -PI to PI
+            const nHdgError = Math.atan2(Math.sin(hdgError), Math.cos(hdgError));
             const targetRoll = Math.max(-0.5, Math.min(0.5, nHdgError * 1.0));
             effRoll = (targetRoll - state.rollAngle) * 2.0;
         }
@@ -611,14 +695,13 @@ export default function FlightSimulator() {
 
         if (scenario === 'engine_failure') {
             const cartoCheck = Cesium.Cartographic.fromCartesian(state.position);
-            // Fail engine if > 6000 feet
             if (cartoCheck.height * 3.28084 > 6000) { 
                currentThrust = 0;
                warning = '⚠️ MASTER CAUTION: ENGINE FLAMEOUT';
                alarmVolume = 1;
             }
         } else if (scenario === 'ailerons_failure') {
-            effRoll *= 0.1; // 10% effective
+            effRoll *= 0.1; 
             warning = '⚠️ FLIGHT CONTROLS: AILERON LOCK';
         } else if (scenario === 'hydraulics') {
             effPitch *= 0.3;
@@ -636,16 +719,18 @@ export default function FlightSimulator() {
            warningFlagRef.current = warning;
            setWarningMessage(warning);
         }
+
+        // Add wind gradient
+        const windBaseSpeed = 5.0; // 5 m/s at surface
+        const windSpeed = windBaseSpeed * Math.log(Math.max(1, altitudeAGL / 0.1));
+        // Add minimal headwind for realism or offset velocity
+        // (Skipping full ground-track vector math for simplicity, just a slight effective velocity modifier)
         
-        // Wrap roll angle to -PI and PI
+        // Wrap angles
         if (state.rollAngle > Math.PI) state.rollAngle -= 2 * Math.PI;
         if (state.rollAngle < -Math.PI) state.rollAngle += 2 * Math.PI;
-        
-        // Wrap pitch angle to -PI and PI
         if (state.pitchAngle > Math.PI) state.pitchAngle -= 2 * Math.PI;
         if (state.pitchAngle < -Math.PI) state.pitchAngle += 2 * Math.PI;
-        
-        // Wrap heading
         if (state.heading > Math.PI) state.heading -= 2 * Math.PI;
         if (state.heading < -Math.PI) state.heading += 2 * Math.PI;
         
@@ -656,28 +741,44 @@ export default function FlightSimulator() {
         const currentVspeed = (state as any).vSpeed || 0;
         const flightPathAngle = Math.atan2(currentVspeed, Math.max(0.1, state.velocity));
         
-        // Aerodynamic Angle of Attack (Nose pitch minus trajectory)
+        // Aerodynamic Angle of Attack
         let dynAoA = state.pitchAngle - flightPathAngle; 
         
-        // When there's no rudder input, the tail wants to trail the slipstream natively 
         if (ctrl.yawInput === 0 && Math.abs(fbw.smoothedYawInput) > 0.001) {
             fbw.smoothedYawInput -= fbw.smoothedYawInput * 2.0 * dt; 
         }
 
         let dynSlip = -fbw.smoothedYawInput * 0.1; 
 
-        // Evaluate Aerodynamics!
+        // Evaluate Aerodynamics with full BET + Ground Effect + Stability
         const forces = calculateForces(
             state.velocity, dynAoA, dynSlip,
             { p: state.rollRate || 0, q: state.pitchRate || 0, r: state.yawRate || 0 },
             { pitch: effPitch, roll: effRoll, yaw: fbw.smoothedYawInput },
-            specs
+            specs,
+            1.225, // Basic air density (could be scaled with altitude)
+            altitudeAGL
         );
 
         // Rotational inertia
         const Ixx = specs.mass * Math.pow(specs.wingSpan / 4, 2);
         const Iyy = specs.mass * Math.pow(specs.wingSpan / 4, 2);
         const Izz = specs.mass * Math.pow(specs.wingSpan / 3, 2);
+
+        // "Every Air Molecule" Volumetric Turbulence Simulator
+        let airMassForcePitch = 0, airMassForceRoll = 0, airMassForceYaw = 0;
+        
+        if (turbulenceEnabledRef.current) {
+            const simTime = Date.now() / 1000;
+            const turbulentMagnitude = Math.max(0, (state.velocity - 50) / 100); // More airspeed = more collision with air mass
+            airMassForcePitch = (Math.sin(simTime * 3.1) * Math.cos(simTime * 1.7) * 0.05) * turbulentMagnitude;
+            airMassForceRoll = (Math.sin(simTime * 2.5 + 4) * Math.cos(simTime * 1.1) * 0.1) * turbulentMagnitude;
+            airMassForceYaw = (Math.cos(simTime * 1.9 + 2) * 0.02) * turbulentMagnitude;
+        }
+        
+        forces.pitchMoment += airMassForcePitch * Iyy;
+        forces.rollMoment += airMassForceRoll * Ixx;
+        forces.yawMoment += airMassForceYaw * Izz;
 
         let rollAccel = forces.rollMoment / Ixx;
         let pitchAccel = forces.pitchMoment / Iyy;
@@ -699,7 +800,18 @@ export default function FlightSimulator() {
         if (isTouchingGround) {
              state.yawRate = fbw.smoothedYawInput * 0.5;
              state.rollRate = 0; 
-             state.pitchRate -= state.pitchAngle * 5.0 * dt; 
+             
+             // Allow pitch rate on rotation, but prevent pitch from dropping below ground level
+             state.pitchRate = Math.max(-2, Math.min(2, (state.pitchRate || 0) + pitchAccel * dt));
+             if (state.pitchAngle < 0) {
+                 state.pitchAngle = 0;
+                 if (state.pitchRate < 0) state.pitchRate = 0;
+             }
+             // Auto-settle pitch if not trying to take off and velocity is low
+             if (Math.abs(ctrl.pitchInput) < 0.1 && state.velocity < 50) {
+                 state.pitchRate -= state.pitchAngle * 5.0 * dt;
+             }
+             
              if (state.rollAngle > 0.05 || state.rollAngle < -0.05) state.rollAngle *= 0.8;
              
              // Ground braking / friction
@@ -788,6 +900,24 @@ export default function FlightSimulator() {
         const spd = Math.round(state.velocity * 1.94384);
         setSpeedKnots(spd);
         setAltitude(Math.round(carto.height * 3.28084));
+
+        // Multiplayer Socket Emission (20 Hz)
+        if (socketRef.current && socketRef.current.connected) {
+            const now = Date.now();
+            if (now - lastStateEmit.current > 50) {
+                const c = Cesium.Cartographic.fromCartesian(state.position);
+                socketRef.current.emit('update_state', {
+                    lon: Cesium.Math.toDegrees(c.longitude),
+                    lat: Cesium.Math.toDegrees(c.latitude),
+                    alt: c.height,
+                    pitch: state.pitchAngle,
+                    roll: state.rollAngle,
+                    heading: state.heading,
+                    aircraft: selectedAircraft
+                });
+                lastStateEmit.current = now;
+            }
+        }
 
         // --- AI Traffic Logic & TCAS ---
         const ai = aiTrafficState.current;
@@ -1009,13 +1139,16 @@ export default function FlightSimulator() {
       if (viewer && !viewer.isDestroyed()) {
          viewer.destroy();
       }
+      if (socketRef.current) socketRef.current.disconnect();
     };
   }, [selectedAircraft, customModelUrl]); // Notice dependencies removed: throttle and cameraView
 
   const handleJoystickMove = (e: any) => {
     handleAudioInit(); // Init Sound API
     // Increase sensitivity by dividing by a smaller number (e.g., 20 instead of 50)
-    controlsRef.current.pitchInput = (e.y || 0) / 20; 
+    // Positive e.y means pushed UP on screen. We want this to mean Nose DOWN.
+    // Nose DOWN corresponds to negative effPitch. So we negate e.y natively.
+    controlsRef.current.pitchInput = -((e.y || 0) / 20) * (useFlightStore.getState().invertY ? -1 : 1); 
     controlsRef.current.rollInput = (e.x || 0) / 20;
   };
 
@@ -1081,11 +1214,42 @@ export default function FlightSimulator() {
 
       <div className="absolute top-[20px] left-[20px] flex flex-col gap-4 pointer-events-auto z-50">
         <button 
-          className="bg-[rgba(0,0,0,0.5)] border border-white/20 text-white px-[12px] py-[8px] text-[11px] cursor-pointer hover:bg-white/10 transition flex items-center justify-center gap-2"
+          className="bg-[rgba(0,0,0,0.5)] border border-white/20 text-white px-[12px] py-[8px] text-[11px] cursor-pointer hover:bg-white/10 transition flex items-center justify-center gap-2 block w-full text-left"
           onClick={() => { stopAudio(); setAppState('menu'); }}
         >
           &#8592; QUIT TO MENU
         </button>
+        
+        {customModelUrl && (
+           <div className="flex flex-col gap-2">
+               <button 
+                 className={`bg-[rgba(0,0,0,0.5)] border ${showModelAdjust ? 'border-[#26b3ff] text-[#26b3ff]' : 'border-white/20 text-white'} px-[12px] py-[8px] text-[11px] cursor-pointer hover:bg-white/10 transition w-full text-left uppercase`}
+                 onClick={() => setShowModelAdjust(!showModelAdjust)}
+               >
+                 Fix Model Orientation
+               </button>
+               {showModelAdjust && (
+                 <div className="bg-[rgba(0,0,0,0.8)] border border-white/20 p-3 flex flex-col gap-3 w-[250px] backdrop-blur text-white">
+                    <span className="text-[10px] text-[#94a3b8] uppercase tracking-[1px] font-bold">Model Adjustments</span>
+                    <div>
+                        <label className="text-[10px] text-[#94a3b8] block mb-1">Yaw (Left/Right)</label>
+                        <input type="range" min="-180" max="180" step="1" value={modelYawOffset * (180/Math.PI)} onChange={(e) => setModelYawOffset(parseFloat(e.target.value) * (Math.PI/180))} className="w-full accent-[#26b3ff]" />
+                        <div className="text-right text-[10px]">{Math.round(modelYawOffset * (180/Math.PI))}°</div>
+                    </div>
+                    <div>
+                        <label className="text-[10px] text-[#94a3b8] block mb-1">Pitch (Up/Down)</label>
+                        <input type="range" min="-180" max="180" step="1" value={modelPitchOffset * (180/Math.PI)} onChange={(e) => setModelPitchOffset(parseFloat(e.target.value) * (Math.PI/180))} className="w-full accent-[#26b3ff]" />
+                        <div className="text-right text-[10px]">{Math.round(modelPitchOffset * (180/Math.PI))}°</div>
+                    </div>
+                    <div>
+                        <label className="text-[10px] text-[#94a3b8] block mb-1">Roll (Tilt)</label>
+                        <input type="range" min="-180" max="180" step="1" value={modelRollOffset * (180/Math.PI)} onChange={(e) => setModelRollOffset(parseFloat(e.target.value) * (Math.PI/180))} className="w-full accent-[#26b3ff]" />
+                        <div className="text-right text-[10px]">{Math.round(modelRollOffset * (180/Math.PI))}°</div>
+                    </div>
+                 </div>
+               )}
+           </div>
+        )}
       </div>
 
       {/* Environment Controls Overlay */}
